@@ -1,0 +1,27 @@
+#*
+*~
+/Debug/
+/heaps/
+/MDS - Core.exe.stackdump
+gdb.exe.stackdump
+/Release/
+LinuxDebug/**/*.o
+LinuxDebug/**/**/*.o
+LinuxDebug/*.exe
+LinuxDebug/*.a
+*.swp
+test/create_array_core
+build/*/dependencies
+build/*/objs
+build/*/libs
+build/*/bin
+build/*/tests
+build/*/heaps
+build/*/tools
+**/#*
+**/.#*
+*doxygen.config
+/doc/html/
+/doc/latex/
+/doc/mpgc-api.pdf
+/doc/*.db
