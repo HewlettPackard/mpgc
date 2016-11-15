@@ -396,10 +396,9 @@ namespace mpgc {
       return _ptr;
     }
 
-    /* Not clear if this is needed */
-    //    constexpr bool is_valid() const noexcept {
-    //      return _ptr.is_valid();
-    //    }
+    constexpr bool is_valid() const noexcept {
+      return _ptr.is_valid();
+    }
 
     /**
      * Swap this gc_ptr with another.

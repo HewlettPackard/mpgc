@@ -27,7 +27,6 @@
 #include <condition_variable>
 #include <unordered_map>
 
-#include "ruts/cuckoo_map.h"
 #include "mpgc/gc_handshake.h"
 #include "mpgc/gc_thread.h"
 #include "mpgc/gc.h"

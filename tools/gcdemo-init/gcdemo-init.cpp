@@ -154,7 +154,7 @@ populateUsers(const unsigned long numUsers, unsigned int mean, unsigned int feed
   
   // Read names from name file
   vector<string> names;
-  string nameStr = "../../../src/tools/gcdemo-init/usernames.txt";
+  string nameStr = "../../../tools/gcdemo-init/usernames.txt";
   ifstream f;
   string line;
 

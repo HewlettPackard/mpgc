@@ -55,7 +55,9 @@
 #include "ruts/managed.h"
 #include <atomic>
 #include <type_traits>
+/*
 #include "ruts/cuckoo_map.h"
+*/
 
 namespace ruts {
 
@@ -258,7 +260,7 @@ namespace ruts {
 //    return std::allocate_shared(managed_space::allocator<managed<T>>(), std::forward(args)...);
 //  }
 
-
+#if 0
   template <typename K, typename V, typename Hash1, typename Hash2, std::size_t SegBits, typename Allocator>
   struct ms<ruts::cuckoo_map<K,V,Hash1,Hash2,SegBits,Allocator>>
   {
@@ -287,7 +289,7 @@ namespace ruts {
   template <typename K, typename V,
   typename Hash1 = ruts::hash1<K>, typename Hash2 = ruts::hash2<K>>
       using ms_small_cuckoo_map = managed<ruts::small_cuckoo_map<K,V,Hash1,Hash2>>;
-
+#endif
 }
 
 
