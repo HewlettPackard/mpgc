@@ -56,7 +56,7 @@ project continues.
 
 The Multi Process Garbage Collector is distributed under the LGPLv3 license 
 with an exception.
-See license files [COPYING](COPYING.md) and [COPYING.LESSER](COPYING.LESSER.md).
+See license files [COPYING](COPYING) and [COPYING.LESSER](COPYING.LESSER).
 
 ## Dependencies
 
