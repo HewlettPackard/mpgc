@@ -3,209 +3,86 @@
       Copyright © 2016 Hewlett Packard Enterprise Development Company LP.
 ===============================================================================
 
-# Multi-Process Garbage Collector
+# Multi Process Garbage Collector (MPGC)
 
-Some wonderful prose explaining the high points of MPGC.
+Author: Susan Spence (susan.spence@hpe.com)
 
-## Building MPGC
+Contributors: Evan Kirshenbaum, Lokesh Gidra,
+Susan Spence, Sergei Uversky.
 
-How to build it
+## Description
 
-## Using MPGC
+Our state-of-the-art Multi Process Garbage Collector (MPGC) delivers
+automatic memory management for applications, enabling multiple
+applications to share objects in memory, while avoiding memory
+management errors and memory leaks.  Whereas commercial garbage
+collectors for memory management today are typically single process
+and they work at the scale of only tens to hundreds of Gigabytes,
+MPGC is ground-breaking in its support for multi-process,
+fault-tolerant garbage collection, and in scaling to heaps greater
+than hundreds of Gigabytes.  The current implementation delivers a
+fault-tolerant, on-the-fly, concurrent garbage collector, with zero
+stop-the-world pauses.  MPGC is used by our Managed Data Structures
+(MDS) library and other non-MDS applications, including applications
+written in unmanaged languages like C++.
 
-How to install and link
+MPGC runs and has been tested on x86 and ARM architectures.  It can
+be used for automatic memory management by multiple application
+processes using a shared object heap in shared (volatile) memory.
+However, MPGC is really designed to deliver the benefits of automatic
+memory management on The Machine and other persistent memory
+architectures.
 
-## Documentation
+## Source
 
-How to install API docs and pointers to static documentation.
+Releases of the MPGC source code are available open source on GitHub:
+https://github.com/HewlettPackard/mpgc
 
-## History
+Maturity: Alpha.  
 
-When were versions published
+MPGC has been developed as part of the Managed Data
+Structures research project at Hewlett Packard Labs.  As such,
+releases of the MPGC source code made available on GitHub are not
+production quality, but rather "alpha" quality.  The MPGC APIs have
+been specified and implemented, but MPGC is not functionally
+complete.  MPGC has gone through basic testing, but may be unstable
+and could cause crashes or data loss.
 
-## Credits
-
-Who is responsible and who supports
+MPGC is an active research project; we intend to make further
+releases with more and/or better features and bug fixes as the
+project continues.
 
 ## License
 
-MPGC is distributed under the GNU Lesser General Public License, with
-an exception:
+The Multi Process Garbage Collector is distributed under the LGPLv3 license 
+with an exception.
+See license files [COPYING](COPYING.md) and [COPYING.LESSER](COPYING.LESSER.md).
 
-~~~
-                   GNU LESSER GENERAL PUBLIC LICENSE
-                       Version 3, 29 June 2007
+## Dependencies
 
- Copyright (C) 2007 Free Software Foundation, Inc. <http://fsf.org/>
- Everyone is permitted to copy and distribute verbatim copies
- of this license document, but changing it is not allowed.
+No dependencies.
 
+## Usage
 
-  This version of the GNU Lesser General Public License incorporates
-the terms and conditions of version 3 of the GNU General Public
-License, supplemented by the additional permissions listed below.
+A User's Guide to the Multi Process Garbage Collector is available on
+the MPGC GitHub site:
+https://github.com/HewlettPackard/mpgc/blob/master/doc/MPGC%20Users'%20Guide.pdf
 
-  0. Additional Definitions.
+This user guide describes in detail how C++ applications can create
+and use data in an MPGC-managed heap, and share data between
+processes, without having to determine when it is safe to free up
+shared memory, and without risk of corrupting the heap if a process
+crashes.
 
-  As used herein, "this License" refers to version 3 of the GNU Lesser
-General Public License, and the "GNU GPL" refers to version 3 of the GNU
-General Public License.
+## Notes
 
-  "The Library" refers to a covered work governed by this License,
-other than an Application or a Combined Work as defined below.
+**Limitations**: Note that the fault-tolerant aspect of MPGC assumes
+  that it is running in a system with persistent memory where caches
+  are flushed on failure; otherwise, we do not guarantee that the
+  heap will not be corrupted as a result of failures.
 
-  An "Application" is any work that makes use of an interface provided
-by the Library, but which is not otherwise based on the Library.
-Defining a subclass of a class defined by the Library is deemed a mode
-of using an interface provided by the Library.
+## See Also
 
-  A "Combined Work" is a work produced by combining or linking an
-Application with the Library.  The particular version of the Library
-with which the Combined Work was made is also called the "Linked
-Version".
-
-  The "Minimal Corresponding Source" for a Combined Work means the
-Corresponding Source for the Combined Work, excluding any source code
-for portions of the Combined Work that, considered in isolation, are
-based on the Application, and not on the Linked Version.
-
-  The "Corresponding Application Code" for a Combined Work means the
-object code and/or source code for the Application, including any data
-and utility programs needed for reproducing the Combined Work from the
-Application, but excluding the System Libraries of the Combined Work.
-
-  1. Exception to Section 3 of the GNU GPL.
-
-  You may convey a covered work under sections 3 and 4 of this License
-without being bound by section 3 of the GNU GPL.
-
-  2. Conveying Modified Versions.
-
-  If you modify a copy of the Library, and, in your modifications, a
-facility refers to a function or data to be supplied by an Application
-that uses the facility (other than as an argument passed when the
-facility is invoked), then you may convey a copy of the modified
-version:
-
-   a) under this License, provided that you make a good faith effort to
-   ensure that, in the event an Application does not supply the
-   function or data, the facility still operates, and performs
-   whatever part of its purpose remains meaningful, or
-
-   b) under the GNU GPL, with none of the additional permissions of
-   this License applicable to that copy.
-
-  3. Object Code Incorporating Material from Library Header Files.
-
-  The object code form of an Application may incorporate material from
-a header file that is part of the Library.  You may convey such object
-code under terms of your choice, provided that, if the incorporated
-material is not limited to numerical parameters, data structure
-layouts and accessors, or small macros, inline functions and templates
-(ten or fewer lines in length), you do both of the following:
-
-   a) Give prominent notice with each copy of the object code that the
-   Library is used in it and that the Library and its use are
-   covered by this License.
-
-   b) Accompany the object code with a copy of the GNU GPL and this license
-   document.
-
-  4. Combined Works.
-
-  You may convey a Combined Work under terms of your choice that,
-taken together, effectively do not restrict modification of the
-portions of the Library contained in the Combined Work and reverse
-engineering for debugging such modifications, if you also do each of
-the following:
-
-   a) Give prominent notice with each copy of the Combined Work that
-   the Library is used in it and that the Library and its use are
-   covered by this License.
-
-   b) Accompany the Combined Work with a copy of the GNU GPL and this license
-   document.
-
-   c) For a Combined Work that displays copyright notices during
-   execution, include the copyright notice for the Library among
-   these notices, as well as a reference directing the user to the
-   copies of the GNU GPL and this license document.
-
-   d) Do one of the following:
-
-       0) Convey the Minimal Corresponding Source under the terms of this
-       License, and the Corresponding Application Code in a form
-       suitable for, and under terms that permit, the user to
-       recombine or relink the Application with a modified version of
-       the Linked Version to produce a modified Combined Work, in the
-       manner specified by section 6 of the GNU GPL for conveying
-       Corresponding Source.
-
-       1) Use a suitable shared library mechanism for linking with the
-       Library.  A suitable mechanism is one that (a) uses at run time
-       a copy of the Library already present on the user's computer
-       system, and (b) will operate properly with a modified version
-       of the Library that is interface-compatible with the Linked
-       Version.
-
-   e) Provide Installation Information, but only if you would otherwise
-   be required to provide such information under section 6 of the
-   GNU GPL, and only to the extent that such information is
-   necessary to install and execute a modified version of the
-   Combined Work produced by recombining or relinking the
-   Application with a modified version of the Linked Version. (If
-   you use option 4d0, the Installation Information must accompany
-   the Minimal Corresponding Source and Corresponding Application
-   Code. If you use option 4d1, you must provide the Installation
-   Information in the manner specified by section 6 of the GNU GPL
-   for conveying Corresponding Source.)
-
-  5. Combined Libraries.
-
-  You may place library facilities that are a work based on the
-Library side by side in a single library together with other library
-facilities that are not Applications and are not covered by this
-License, and convey such a combined library under terms of your
-choice, if you do both of the following:
-
-   a) Accompany the combined library with a copy of the same work based
-   on the Library, uncombined with any other library facilities,
-   conveyed under the terms of this License.
-
-   b) Give prominent notice with the combined library that part of it
-   is a work based on the Library, and explaining where to find the
-   accompanying uncombined form of the same work.
-
-  6. Revised Versions of the GNU Lesser General Public License.
-
-  The Free Software Foundation may publish revised and/or new versions
-of the GNU Lesser General Public License from time to time. Such new
-versions will be similar in spirit to the present version, but may
-differ in detail to address new problems or concerns.
-
-  Each version is given a distinguishing version number. If the
-Library as you received it specifies that a certain numbered version
-of the GNU Lesser General Public License "or any later version"
-applies to it, you have the option of following the terms and
-conditions either of that published version or of any later version
-published by the Free Software Foundation. If the Library as you
-received it does not specify a version number of the GNU Lesser
-General Public License, you may choose any version of the GNU Lesser
-General Public License ever published by the Free Software Foundation.
-
-  If the Library as you received it specifies that a proxy can decide
-whether future versions of the GNU Lesser General Public License shall
-apply, that proxy's public statement of acceptance of any version is
-permanent authorization for you to choose that version for the
-Library.
-
-
-
-  ** As an exception, the copyright holders of this Library grant you 
-  ** permission to (i) compile an Application with the Library, and 
-  ** (ii) distribute the Application containing code generated by the 
-  ** Library and added to the Application during this compilation process 
-  ** under terms of your choice, provided you also meet the terms and 
-  ** conditions of the Application license.
-~~~
+The Managed Data Structures software library, which uses MPGC for its
+automatic memory management: https://github.com/HewlettPackard/mds
 
