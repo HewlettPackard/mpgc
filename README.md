@@ -74,6 +74,8 @@ processes, without having to determine when it is safe to free up
 shared memory, and without risk of corrupting the heap if a process
 crashes.
 
+For instructions on installing MPGC, see [INSTALL.md](INSTALL.md).
+
 ## Notes
 
 **Limitations**: Note that the fault-tolerant aspect of MPGC assumes
