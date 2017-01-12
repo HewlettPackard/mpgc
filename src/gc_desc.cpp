@@ -342,7 +342,7 @@ namespace mpgc {
 	}
 	i++;
       }
-      while (++i < n_fields) {
+      for (; i < n_fields; i++) {
 	missing.push_back(i);
       }
       rep_type neg_list = gc_descriptor::list_rep(n_fields, n_missing, false, 
