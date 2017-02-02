@@ -66,7 +66,7 @@ No dependencies.
 
 A User's Guide to the Multi Process Garbage Collector is available on
 the MPGC GitHub site:<br>
-https://github.com/HewlettPackard/mpgc/blob/master/doc/MPGC%20Users'%20Guide.pdf
+https://github.com/HewlettPackard/mpgc/blob/master/doc/MPGC-User-Guide.pdf
 
 This user guide describes in detail how C++ applications can create
 and use data in an MPGC-managed heap, and share data between
