@@ -1,6 +1,6 @@
 ##
 #
-#  `Multi Process Garbage Collector
+#  Multi Process Garbage Collector
 #  Copyright © 2016 Hewlett Packard Enterprise Development Company LP.
 #
 #  This program is free software: you can redistribute it and/or modify
@@ -62,6 +62,10 @@ incl_dir := $(project_dir)/include
 
 src_dir := $(project_dir)/src
 
+$(project_name)_generated_src_dir ?= $(generated_src_dir)
+generated_src_dir ?= $(project_dir)/generated-src
+
+
 #######
 #
 # $(call subdirs,dir) lists all non-empty subdirectories of a directory
@@ -72,16 +76,22 @@ subdirs = $(foreach f,$(wildcard $(1)/*),$(if $(wildcard $(f)/*),$(f)))
 
 # Non-empty subdirectories of $(src)
 
-src_subdirs := $(call subdirs,$(src_dir))
+static_src_subdirs := $(call subdirs,$(src_dir))
+generated_src_subdirs := $(call subdirs,$(generated_src_dir))
 
 ignore_src_dirs ?= unused obsolete
 $(project_name)_ignore_src_dirs ?= $(ignore_src_dirs)
 
 ignore_src_dir_patterns := $(addprefix %/,$($(project_name)_ignore_src_dirs))
 
-src_dirs := $(src_dir) $(filter-out $(ignore_src_dir_patterns),$(src_subdirs))
-src_files := $(wildcard $(addsuffix /*.cpp,$(src_dirs)))
-rel_src_files := $(patsubst $(src_dir)/%,%,$(src_files))
+static_src_dirs := $(src_dir) $(filter-out $(ignore_src_dir_patterns),$(static_src_subdirs))
+generated_src_dirs := $(generated_src_dir) $(filter-out $(ignore_src_dir_patterns),$(generated_src_subdirs))
+
+src_dirs := $(static_src_dirs) $(generated_src_dirs)
+
+static_src_files := $(wildcard $(addsuffix /*.cpp,$(static_src_dirs)))
+generated_src_files := $(wildcard $(addsuffix /*.cpp,$(generated_src_dirs)))
+rel_src_files := $(patsubst $(src_dir)/%,%,$(static_src_files)) $(patsubst $(generated_src_dir)/%,%,$(generated_src_files))
 obj_root_dir := objs
 obj_files := $(addprefix $(obj_root_dir)/,$(rel_src_files:.cpp=.o))
 dep_root_dir := dependencies
@@ -89,6 +99,7 @@ dep_files := $(addprefix $(dep_root_dir)/,$(rel_src_files:.cpp=.d))
 
 lib_dir := libs
 make_static_lib = $(lib_dir)/lib$(1).a
+make_shared_lib = $(lib_dir)/lib$(1).so
 
 bin_classes := tools tests
 
@@ -107,7 +118,12 @@ bin_dep_files = $(addprefix $(dep_root_dir)/,$(patsubst %.cpp,%.d,$(call bin_rel
 
 lib_name ?= $(project_name)
 $(project_name)_lib_name ?= $(lib_name)
+
 static_lib := $(call make_static_lib,$($(project_name)_lib_name))
+shared_lib := $(call make_shared_lib,$($(project_name)_lib_name))
+
+lib_targets ?= $(static_lib)
+$(project_name)_lib_targets ?= $(lib_targets)
 
 obj_to_dep = $(1:$(obj_root_dir)/%.o=$(dep_root_dir)/%.d)
 not_defined = $(findstring $(origin $1),undefined)
@@ -146,7 +162,7 @@ $(project_name)_install_pdf_dir ?= $(install_pdf_dir)
 installed_include_subdirs ?= $(notdir $(call subdirs,$(incl_dir)))
 $(project_name)_installed_include_subdirs ?= $(installed_include_subdirs)
 
-installed_libs ?= $(notdir $(static_lib))
+installed_libs ?= $(notdir $(lib_targets))
 $(project_name)_installed_libs ?= $(installed_libs)
 
 installed_lib_files = $(addprefix $($(project_name)_install_lib_dir)/,$($(project_name)_installed_libs))
@@ -177,7 +193,10 @@ std_flag = $(if $(call not_defined,$(project_name)_cpp_std),,-std=$($(project_na
 cpp_defines ?=
 $(project_name)_cpp_defines ?= $(cpp_defines)
 
-cpp_includes ?= $(addprefix -I,$($(project_name)_incl_dirs))
+extra_incl_dirs ?=
+$(project_name)_extra_incl_dirs ?= $(extra_incl_dirs)
+
+cpp_includes ?= $(addprefix -I,$($(project_name)_incl_dirs) $($(project_name)_extra_incl_dirs))
 $(project_name)_cpp_includes ?= $(cpp_includes)
 
 cpp_dep_flags ?= -MMD -MP -MF"$(call obj_to_dep,$@)"
@@ -226,7 +245,7 @@ $(project_name)_LIBS ?= $(LIBS)
 
 .DEFAULT_GOAL := all
 
-all: $(static_lib) tools
+all: $(lib_targets) tools
 
 .DELETE_ON_ERROR:
 
@@ -365,8 +384,23 @@ $(static_lib) : $(obj_files) $(libs_used)
 	@echo Finished building library: $@
 	@echo
 
+$(shared_lib) : $(obj_files) $(libs_used)
+	@echo Building library: $@
+	-@mkdir -p $(dir $@)
+	$(CXX) $(LDFLAGS) -shared -o $@ $^ $(LIBS)
+	@echo Finished building library: $@
+	@echo
+
 
 $(obj_root_dir)/%.o: $(src_dir)/%.cpp
+	@echo Building file: $<
+	-@mkdir -p $(dir $@)
+	-@mkdir -p $(dir $(call obj_to_dep,$@))
+	$(CXX) -c $($(project_name)_CPPFLAGS) $($(project_name)_CXXFLAGS) -o "$@" "$<"
+	@echo Finished building: $<
+	@echo
+
+$(obj_root_dir)/%.o: $(generated_src_dir)/%.cpp
 	@echo Building file: $<
 	-@mkdir -p $(dir $@)
 	-@mkdir -p $(dir $(call obj_to_dep,$@))
@@ -437,7 +471,7 @@ private-manual:	private-doc
 
 .PHONY: clean clean-lib clean-objs clean-dependencies clean-recursive
 
-clean: clean-lib clean-objs clean-dependencies
+clean: clean-lib clean-objs clean-dependencies clean-generated
 
 clean-objs:
 	-rm -rf $(obj_root_dir)/*
@@ -447,6 +481,9 @@ clean-dependencies:
 
 clean-lib:
 	-rm -f $(lib_dir)/*
+
+clean-generated:
+	-rm -f $(generated_src_dir)/*
 
 clean-recursive: clean $(foreach p,$($(project_name)_projects_used),clean-$(p))
 
@@ -472,8 +509,9 @@ install-progs: $(foreach i,$($(project_name)_installed_progs),install-$(i))
 install-includes: FORCE
 	@echo Syncing include dirs
 	$(if $(wildcard $(incl_dir)/*.h),cp $(incl_dir)/*.h $($(project_name)_install_includes_dir))
+	$(if $(addprefix $(incl_dir)/,$($(project_name)_installed_include_subdirs)),\
 	rsync -rvui --include '*/' --include '*.h' --exclude '*' --delete-excluded \
-	  $(addprefix $(incl_dir)/,$($(project_name)_installed_include_subdirs)) $($(project_name)_install_includes_dir)
+	  $(addprefix $(incl_dir)/,$($(project_name)_installed_include_subdirs)) $($(project_name)_install_includes_dir))
 
 install-doc: install-html install-manual
 
@@ -525,18 +563,34 @@ clean-installed-html:
 #
 ####
 
-autobuild_project_dirs ?= gc common core
-autobuild_files ?= build.mk defs.mk BUILDING.md
-autobuild_paths ?= $(addprefix $(build_dir)/,$(autobuild_files))
+MDS_CRD := Managed Data Structures
+MPGC_CRD := Multi Process Garbage Collector
 
+autobuild_project_dirs ?= gc:MPGC common:MPGC core:MDS java-api:MDS
+
+define dist_copy_file
+-sed '$(3)s/.*/$(4)/' $(build_dir)/$(1) >$(git_base_dir)/$(2)/build/$(notdir $(1))
+endef
 define distribute_to
 distribute-to-$(1): FORCE
 ifneq ($$(build_dir),$$(git_base_dir)/$(1)/build)
-	-cp $$(autobuild_paths) $$(git_base_dir)/$(1)/build
+	$(call dist_copy_file,build.mk,$(1),3,#  $(2))
+	$(call dist_copy_file,defs.mk,$(1),3,#  $(2))
+	$(call dist_copy_file,BUILDING.md,$(1),2,      $(2))
 endif
 endef
 
-$(foreach p,$(autobuild_project_dirs),$(eval $(call distribute_to,$(p))))
+nullstring :=
+space := $(nullstring) $(nullstring)
+auto_build_dir_name = $(word 1,$(subst :,$(space),$(1)))
+auto_build_crd = $($(word 2,$(subst :,$(space),$(1)))_CRD)
 
-distribute-autobuild: $(foreach p,$(autobuild_project_dirs),distribute-to-$(p))
+define dist_to_aux
+$(eval $(call distribute_to,$(call auto_build_dir_name,$(1)),$(call auto_build_crd,$(1))))
+endef
+
+$(foreach p,$(autobuild_project_dirs),$(eval $(call dist_to_aux,$(p))))
+
+distribute-autobuild: $(foreach p,$(autobuild_project_dirs),distribute-to-$(call auto_build_dir_name,$(p)))
+
 

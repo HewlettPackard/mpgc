@@ -31,7 +31,7 @@ project_name = mpgc
 projects_used = ruts
 installed_progs ?= createheap standalone-gc
 
-ruts_project_dir ?= $(if $(wildcard $(project_dir)/ruts/build),$(project_dir)/ruts,$(git_base_dir)/common)
+ruts_project_dir ?= $(if $(is_exported_repo),$(top_level_repo)/ruts,$(call repo_dir,RUTS,common,ruts_project_dir))
 
 define doxygen_args
 PROJECT_NAME = MPGC
