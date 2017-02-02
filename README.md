@@ -56,7 +56,7 @@ project continues.
 
 The Multi Process Garbage Collector is distributed under the LGPLv3 license 
 with an exception.
-See license files [COPYING](https://github.com/HewlettPackard/mds/blob/master/COPYING) and [COPYING.LESSER](https://github.com/HewlettPackard/mds/blob/master/COPYING.LESSER).
+See license files [COPYING](https://github.com/HewlettPackard/mpgc/blob/master/COPYING) and [COPYING.LESSER](https://github.com/HewlettPackard/mpgc/blob/master/COPYING.LESSER).
 
 ## Dependencies
 
@@ -74,7 +74,7 @@ processes, without having to determine when it is safe to free up
 shared memory, and without risk of corrupting the heap if a process
 crashes.
 
-For instructions on installing MPGC, see [INSTALL.md](https://github.com/HewlettPackard/mds/blob/master/INSTALL.md).
+For instructions on installing MPGC, see [INSTALL.md](https://github.com/HewlettPackard/mpgc/blob/master/INSTALL.md).
 
 ## Notes
 
