@@ -78,6 +78,7 @@ namespace mpgc {
   {
     using base = gc_allocated_with_virtuals<external_descriptor, external_descriptor_disc>;
   public:
+    static void init_vf_table(typename base::vf_table &);
     /**
      * The gc_allocated_with_virtuals dispatch object for external_descriptor.
      */
@@ -358,11 +359,10 @@ namespace mpgc {
       return gc_descriptor(gc_descriptor::direct(), pos_list);
     }
     if (n_fields <= 32) {
-      assert(false);
       return gc_descriptor(gc_descriptor::direct(), 
-			   gc_descriptor::bitmap_rep(n_fields,
-						     field_offsets.cbegin(), 
-						     field_offsets.cend()));
+                           gc_descriptor::bitmap_rep(n_fields,
+                                                     field_offsets.cbegin(), 
+                                                     field_offsets.cend()));
     }
     // Nothing for it but to do an external one.
     return make_external();
@@ -431,6 +431,9 @@ namespace mpgc {
           cout << hex;
           cout << "      map = " << bitmap_map_fld[_rep] << endl;
         }
+        for_each_ref_index([](auto i) {
+            cout << "    field = " << i << endl;
+          });
         break;
       }
     case cat::list:
@@ -495,9 +498,8 @@ namespace mpgc {
     }
   }
 
-  template <>
-  void gc_allocated_with_virtuals<gc_descriptor::external_descriptor,
-                                  external_descriptor_disc>
+  void
+  gc_descriptor::external_descriptor
   ::init_vf_table(vf_table &ctable) {
     ctable.bind<gc_descriptor::include_list_external_descriptor>();
   }

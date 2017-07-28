@@ -34,8 +34,16 @@
 #include "mpgc/gc_desc.h"
 
 namespace mpgc {
+  namespace gc_handshake {
+    struct in_memory_thread_struct;
+  }
+
+  namespace gc_allocator {
+    class bump_allocation_slots;
+  }
   class gc_token {
     friend class gc_allocated;
+    friend class gc_allocator::bump_allocation_slots;
     template <typename T> friend class gc_allocator__;
     const gc_descriptor descriptor;
     explicit gc_token(const gc_descriptor &d)
@@ -47,7 +55,7 @@ namespace mpgc {
   class gc_allocated {
     gc_descriptor _descriptor;
 
-    friend void allocation_epilogue(void*, gc_token&, std::size_t);
+    friend void allocation_epilogue(gc_handshake::in_memory_thread_struct&, void*, gc_token&, std::size_t);
     protected:
     /*
      * By requiring a gc_token parameter, we ensure that
@@ -65,7 +73,7 @@ namespace mpgc {
     explicit gc_allocated(gc_token &gc) 
       : _descriptor(gc_descriptor::install{}, gc.descriptor)
     {
-      // assert(_descriptor.is_valid());
+      //assert(_descriptor.is_valid());
     }
   public:
     /*

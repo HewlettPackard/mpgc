@@ -35,8 +35,7 @@
 #include <cassert>
 #include <regex>
 
-#include "mpgc/gc_thread.h"
-#include "mpgc/gc_allocator.h"
+#include "mpgc/gc.h"
 
 using namespace std;
 
@@ -172,8 +171,15 @@ int main(int argc, char **argv) {
   }
 
   make_file(heap_file, heap_size, "GC heap file");
+  setenv("MPGC_GC_HEAP", heap_file.c_str(), 1);
+
   make_file(ctrl_file, ctrl_size, "Control file");
-  
+  setenv("MPGC_CONTROL_HEAP", ctrl_file.c_str(), 1);
+
+  mpgc::init_on_createheap();
+
+  unsetenv("MPGC_GC_HEAP");
+  unsetenv("MPGC_CONTROL_HEAP");
 
   return 0;
 }

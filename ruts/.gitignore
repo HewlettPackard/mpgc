@@ -14,6 +14,11 @@ test/create_array_core
 build/*/dependencies
 build/*/objs
 build/*/libs
+build/*/bin
+build/*/tests
+build/*/heaps
+build/*/tools
 **/#*
+**/.#*
 *doxygen.config
 /doc/

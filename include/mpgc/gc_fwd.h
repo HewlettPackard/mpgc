@@ -55,6 +55,10 @@ namespace mpgc {
   template <typename T>
   using external_gc_array_ptr = external_gc_ptr<gc_array<T>>;
   using external_gc_anchor = external_gc_ptr<const gc_allocated>;
+  template <typename T> class external_weak_gc_ptr;
+
+  template <typename T> class weak_gc_ptr;
+  template <typename T, typename C=gc_allocated> class contingent_gc_ptr;
 
 
   template <typename X, typename ...Args>

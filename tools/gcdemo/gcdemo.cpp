@@ -86,6 +86,8 @@ thread_local size_t current_rcu_count = 0;
 constexpr size_t rcu_count_per_window = 10;
 static chrono::microseconds maxTimeForIter;
 
+thread_local RandomSeed random_seed;
+
 void show_usage() {
    cerr << "usage: ./gcdemo [options]\n"
         << "\n"
@@ -179,38 +181,40 @@ void notifyUsers(unordered_set<gc_ptr<User>>& users, gc_ptr<Post>& post, Fn&& fu
 
 unsigned long post(gc_ptr<User> usr, double postTagMean, unsigned long numUsers)
 {
-  unsigned int numFriends = usr->friends.size();
-  TagRNG rng(postTagMean, 0, numFriends);
-
   // Create a payload for a new post, then the new post
-  UniformRNG payloadrng(100, 1000);
-  string payload(payloadrng.randElt(), 'p');
+  string payload(UniformRNG(100, 1000).randElt(), 'p');
 
-  unordered_set<gc_ptr<User>> localTagged;
-  unsigned int numTags = rng.numPostTags();
+  unsigned int numFriends = usr->friends.size();
+  gc_array_ptr<gc_ptr<User>> newTags;
+  if (numFriends) {
+    TagRNG rng(postTagMean, 0, numFriends);
+    unsigned int numTags = rng.numPostTags();
+    newTags = make_gc_array<gc_ptr<User>>(numTags);
 
-  localTagged.reserve(numTags + 1);
-
-  // Add user to set of tags
-  localTagged.insert(usr);
-
-  // Tag a number of friends as well
-  for (unsigned int i = 0; i < numTags; i++) {
-    localTagged.insert(usr->friends[rng.randElt()]);
+    // Tag a number of friends as well
+    for (unsigned int i = 0; i < numTags; i++) {
+      newTags[i] = usr->friends[rng.randElt()];
+    }
+  } else {
+    newTags = make_gc_array<gc_ptr<User>>(0);
   }
-
-  gc_ptr<Post> newPost = make_gc<Post>(payload, localTagged);
+  gc_ptr<Post> newPost = make_gc<Post>(usr, payload, newTags);
 
   // Identify set of tagged users and their friends
   unordered_set<gc_ptr<User>> usersToNotify;
-  usersToNotify.reserve(localTagged.size() + 1);
-  usersToNotify.insert(localTagged.begin(), localTagged.end());
-  usersToNotify.insert(usr);
+  //All tags must be in my friends.
+  numFriends++;
+  for (auto u : newTags) {
+    numFriends += u->friends.size();
+  }
 
-  // Add the friends of all tagged users to the notification set
-  for (auto u : localTagged) {
-    for (auto f : u->friends)
+  usersToNotify.reserve(numFriends);
+  usersToNotify.insert(usr);
+  usersToNotify.insert(usr->friends.begin(), usr->friends.end());
+  for (auto u : newTags) {
+    for (auto f : u->friends) {
       usersToNotify.insert(f);
+    }
   }
 
   // Push the new post to all of the users in the notification set
@@ -220,49 +224,70 @@ unsigned long post(gc_ptr<User> usr, double postTagMean, unsigned long numUsers)
   return usersToNotify.size();
 }
 
-unsigned long comment(gc_ptr<User> usr, double commentTagMean, unsigned long numUsers)
+unsigned long comment(gc_ptr<User> usr, double commentTagMean, double postTagMean, unsigned long numUsers)
 {
-  unsigned int numFriends = usr->friends.size();
-  unsigned int feedSize   = (usr->feed).load().size();
-  TagRNG rng(0, commentTagMean, numFriends);
-  UniformRNG postrng((usr->feed).load().size());
+  auto localFeed = usr->feed.load();
+  unsigned int feedSize   = localFeed.size();
 
   assert(feedSize > 0); // Shouldn't be commenting if we have nothing to comment on
+  UniformRNG postrng(feedSize);
+  gc_ptr<Post> p = nullptr;
 
   // Pick post at random from user's feed
-  auto post = (usr->feed).load()[postrng.randElt()];
-
-  // Create a comment and attach it to the post
-  UniformRNG payloadrng(100, 1000);
-  string payload(payloadrng.randElt(), 'c');
-  auto comment = make_gc<Comment>(post, payload);
-  post->addComment(comment);
-
-  // Tag some more friends
-  unordered_set<gc_ptr<User>> newTags;
-
-  unsigned int numTags = rng.numCommentTags();
-  newTags.reserve(numTags);
-
-  for (unsigned int i = 0; i < numTags; i++) {
-    newTags.insert(usr->friends[rng.randElt()]);
+#ifdef TEST_WEAK_PTRS
+  for (size_t i = 0; i < feedSize; i++) {
+    p = localFeed[postrng.randElt()].lock();
+    if (p) {
+      break;
+    }
   }
-  post->addTags(newTags);
-  
-  // Bump post to top of feeds for each tagged user and their friends
-  auto localTagged = (post->tagged).load();
-  unordered_set<gc_ptr<User>> usersToNotify;
-  usersToNotify.reserve(localTagged.size() + 1);
-  usersToNotify.insert(localTagged.begin(), localTagged.end());
-  usersToNotify.insert(usr);
 
+  if (!p) {
+    return post(usr, postTagMean, numUsers);
+  }
+#else
+  p = localFeed[postrng.randElt()];
+#endif
+  // Create a comment and attach it to the post
+  string payload(UniformRNG(100, 1000).randElt(), 'c');
+  // Tag some friends
+  gc_array_ptr<gc_ptr<User>> newTags;
+  unsigned int numFriends = usr->friends.size();
+  if (numFriends) {
+    TagRNG rng(0, commentTagMean, numFriends);
+    unsigned int numTags = rng.numCommentTags();
+    newTags = make_gc_array<gc_ptr<User>>(numTags);
+    for (unsigned int i = 0; i < numTags; i++) {
+      newTags[i] = usr->friends[rng.randElt()];
+    }
+  } else {
+    newTags = make_gc_array<gc_ptr<User>>(0);
+  }
+
+  auto comment = make_gc<Comment>(usr, p, payload, newTags);
+  p->addComment(comment);
+
+  // Bump post to top of feeds for each tagged user and their friends
+  auto localSubs = (p->subscribers).load();
+  unordered_set<gc_ptr<User>> usersToNotify;
+  //Subscribers list contain this user.
+  numFriends += localSubs.size();
+  for (auto u : newTags) {
+    numFriends += u->friends.size();
+  }
+  usersToNotify.reserve(numFriends);
+  usersToNotify.insert(usr->friends.begin(), usr->friends.end());
+  usersToNotify.insert(localSubs.begin(), localSubs.end());
   // Add the friends of all the tagged users to the notification set
-  for (auto u : localTagged)
+  for (auto u : newTags)
     for (auto f : u->friends)
       usersToNotify.insert(f);
 
+  if (usersToNotify.size() > 100000) {
+    cout << "Notified: " << usersToNotify.size() << " Subscribers: " << localSubs.size() << "\n";
+  }
   // Bump the post for all the users in the notification set
-  notifyUsers(usersToNotify, post, [](gc_ptr<User>& u, gc_ptr<Post>& p) { return u->bumpInFeed(p); });
+  notifyUsers(usersToNotify, p, [](gc_ptr<User>& u, gc_ptr<Post>& p) { return u->bumpInFeed(p); });
 
   return usersToNotify.size();
 }
@@ -310,7 +335,7 @@ void clientThread(UserGraphPtr users, unsigned long iters, double postTagMean,
       log << "post.";
     }
     else {
-      comment(u, commentTagMean, numUsers);
+      comment(u, commentTagMean, postTagMean, numUsers);
       log << "comment.";
     }
 
@@ -349,7 +374,6 @@ void benchThread(UserGraphPtr users, unsigned long iters, double postTagMean,
   while (g_threadCtr->load() != g_threadMax)
     ;
 
-
   chrono::steady_clock::time_point startBench, endBench;
   startBench = chrono::steady_clock::now();
   t1 = startBench;
@@ -365,7 +389,7 @@ void benchThread(UserGraphPtr users, unsigned long iters, double postTagMean,
 
     unsigned long ret = (actionrng.isPost() || feedSize == 0)
       ? post(u, postTagMean, numUsers)
-      : comment(u, commentTagMean, numUsers);
+      : comment(u, commentTagMean, postTagMean, numUsers);
 
     g_usersNotified->fetch_add(ret);
 
@@ -374,7 +398,6 @@ void benchThread(UserGraphPtr users, unsigned long iters, double postTagMean,
     }
     i = g_iterCtr->fetch_add(1);
   }
-
   ctr = g_threadCtr->fetch_sub(1);
   // Have the last thread to finish indicate that the benchmark is over.
   if (ctr == 1) {

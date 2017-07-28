@@ -137,7 +137,6 @@ namespace ruts {
       return out << std::hex << key.high << "::" << key.low;
     }
 
-
   };
 
   template<>
@@ -158,7 +157,21 @@ namespace ruts {
     return lhs.high == rhs.high && lhs.low == rhs.low;
   }
   inline bool operator!=(const uniform_key &lhs, const uniform_key &rhs) {
-    return lhs.high != rhs.high || lhs.low != rhs.low;
+    return !(lhs == rhs);
+  }
+  inline bool operator<(const uniform_key &lhs, const uniform_key &rhs) {
+    return (lhs.high < rhs.high)
+      || (lhs.high == rhs.high && lhs.low < rhs.low);
+  }
+  inline bool operator>(const uniform_key &lhs, const uniform_key &rhs) {
+    return (lhs.high > rhs.high)
+      || (lhs.high == rhs.high && lhs.low > rhs.low);
+  }
+  inline bool operator<=(const uniform_key &lhs, const uniform_key &rhs) {
+    return !(lhs > rhs);
+  }
+  inline bool operator>=(const uniform_key &lhs, const uniform_key &rhs) {
+    return !(lhs < rhs);
   }
 
   struct with_uniform_id {

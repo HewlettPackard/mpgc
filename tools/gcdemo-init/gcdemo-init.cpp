@@ -57,6 +57,8 @@ const unsigned int  _DEFAULT_FEED_LENGTH = 250,
                     _DEFAULT_MEAN = 200;
 static const string _DEFAULT_NAME = "com.hpe.gcdemo.users";
 
+thread_local RandomSeed random_seed;
+
 void show_usage() {
    cerr << "usage: ./gcdemo-init [options]\n\n"
         << "Initialize a randomized graph of users and their friendships in the persistent heap."
@@ -151,7 +153,7 @@ populateUsers(const unsigned long numUsers, unsigned int mean, unsigned int feed
 {
   InitRNG userrng(numUsers, mean);
   auto users = UserGraph(numUsers);
-  
+  unordered_map<unsigned long, gc_ptr<User>> id_to_user;
   // Read names from name file
   vector<string> names;
   string nameStr = "../../../tools/gcdemo-init/usernames.txt";
@@ -169,15 +171,28 @@ populateUsers(const unsigned long numUsers, unsigned int mean, unsigned int feed
   // Populate vector with randomly-named users
   UniformRNG namerng(names.size());
   users.reserve(numUsers);
+  id_to_user.reserve(numUsers);
   for (unsigned long i = 0; i < numUsers; i++) {
     users[i] = make_gc<User>(feedLength, names[namerng.randElt()]);
+    id_to_user[users[i]->id] = users[i];
   }
   cout << "Done.\n" << flush;
 
   cout << "Generating friendships (this step might take a while)...\n" << flush;
   displayProgressBarHeader();
   UserGraphPtr usersPtr = make_gc<WrappedUserGraph>(users);
-  addFriends(usersPtr, mean);
+
+  f.open("/data/gidra/soc-pokec-relationships.txt");
+  unsigned long first, second, i = 0, prev_first = 0;
+  while (f >> first >> second) {
+   id_to_user[first]->friends.push_back(id_to_user[second]);
+   if (first != prev_first) {
+     prev_first = first;
+     advanceProgressBar(i++, numUsers);
+   }
+  }
+  f.close();
+  //addFriends(usersPtr, mean);
   cout << "\nDone." << endl;
 
   cout << "Calculating statistics for friends per user..." << endl;
@@ -205,7 +220,7 @@ populateUsers(const unsigned long numUsers, unsigned int mean, unsigned int feed
        << " friends." << endl;
   cout << "  Max: User " << maxName << " [id: " << maxId << "] has " << maxFriends
        << " friends." << endl;
-  
+  cout << "\n";
   return usersPtr;
 }
 

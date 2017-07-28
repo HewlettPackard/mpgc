@@ -43,6 +43,7 @@
 #include <atomic>
 #include <ostream>
 #include "mpgc/gc_ptr.h"
+#include "mpgc/weak_gc_ptr.h"
 
 namespace mpgc {
   extern void initialize();
@@ -291,7 +292,209 @@ namespace mpgc {
 
       };
 
+      class inbound_weak_table {
+      public:
+
+        struct slot {
+          std::atomic<std::size_t> _rc{0};
+          weak_gc_ptr<target_base> _ptr{nullptr};
+          slot *_next_free{nullptr};
+        };
+
+        struct block {
+          constexpr static std::size_t block_size = 10000;
+          slot slots[block_size];
+          block *next{nullptr};
+        };
+
+        struct free_list {
+          slot * const head;
+          free_list *next{nullptr};
+
+          explicit free_list(slot *fl)
+          : head{fl}
+          {}
+        };
+
+        // The version number holds the next free slot.
+        using current_ptr_t = ruts::versioned_ptr<block>;
+
+        current_ptr_t::atomic_pointer _current_block;
+        std::atomic<free_list *> _available_free_lists{nullptr};
+
+        /*
+         * This should probably be private and friended to mpgc::gc_handshake::initialize();
+         */
+        static inbound_weak_table *table(bool from_gc) {
+          static inbound_weak_table *t = new inbound_weak_table;
+          if (!from_gc) {
+            mpgc::initialize_thread();
+          }
+          return t;
+        }
+
+        static inbound_weak_table &table() {
+	  /*
+	   * We intentionally leak the table, because we need to
+	   * ensure that objects that were created before us (e.g.,
+	   * statics) that have inbound pointers can be destroyed.
+           *
+           * The static is thread-local to ensure that table(false)
+           * (and, therefore, mpgc::initialize()) are called in each
+           * thread that first touch the GC by this path.
+	   */
+          static thread_local inbound_weak_table *t = table(false);
+          return *t;
+        }
+
+        template <typename Fn>
+        void for_each_slot(Fn&& func) {
+          for (block *b = _current_block; b != nullptr; b = b->next) {
+            for (slot &s : b->slots) {
+              std::forward<Fn>(func)(s._ptr);
+            }
+          }
+        }
+
+        slot *get_returned_free_list() {
+          auto rr = ruts::try_cas_loop(_available_free_lists,
+                                       [](const free_list *flp) {
+                                         return flp != nullptr;
+                                       }, [](const free_list *flp) {
+                                         return flp->next;
+                                       });
+          if (rr) {
+            /*
+             * we successfully pulled off a free list.  Once we're
+             * done with it, we can delete it.
+             */
+            const free_list *flp = rr.prior_value;
+            slot *val = flp->head;
+            delete flp;
+            return val;
+          } else {
+            return nullptr;
+          }
+        }
+
+        slot *carve_off_free_slot() {
+          block *created_block = nullptr;
+          bool used_created = false;
+          slot *val;
+          _current_block.update([&](current_ptr_t b) {
+              if (b != nullptr && b.version() <= block_size) {
+                /*
+                 * There's still room.  Carve a slot off.
+                 */
+                std::size_t i = b.version()++;
+                val = b->slots+i;
+                used_created = false;
+                return b;
+              }
+              /*
+               *  We've used the last slot in this block.
+               *  Need to add a new block.
+               */
+              if (created_block == nullptr) {
+                created_block = new block;
+              }
+              created_block->next = b;
+              val = created_block->slots+0;
+              used_created = true;
+              return current_ptr_t(created_block,
+                                   ruts::version_num{1});
+            });
+          if (!used_created && created_block != nullptr) {
+            /*
+             * We created a block but didn't wind up using it, so
+             * it needs to be deleted.
+             */
+            delete created_block;
+          }
+          return val;
+        }
+
+        void release_free_list(slot *head) {
+          free_list *fl = new free_list{head};
+          ruts::cas_loop(_available_free_lists,
+                         [=](free_list *current) {
+                           fl->next = current;
+                           return fl;
+                         });
+        }
+
+        friend class local_free_list;
+
+        struct local_free_list {
+          slot *head = nullptr;
+          
+          ~local_free_list() {
+            if (head != nullptr) {
+              table().release_free_list(head);
+            }
+          }
+
+          static local_free_list &inst() {
+            static thread_local local_free_list l;
+            return l;
+          }
+
+        };
+
+        static slot *obtain_free_slot() {
+          slot *&local = local_free_list::inst().head;
+          if (local == nullptr) {
+            local = table().get_returned_free_list();
+            if (local == nullptr) {
+              return table().carve_off_free_slot();
+            }
+          }
+          slot *val = local;
+          local = local->_next_free;
+          return val;
+        }
+
+        static void release_slot(slot *s) {
+          slot *&local = local_free_list::inst().head;
+          s->_ptr = nullptr;
+          s->_next_free = local;
+          local = s;
+        }
+
+        static void drop_reference(slot *s) {
+          if (s != nullptr) {
+            if (--(s->_rc) == 0) {
+              release_slot(s);
+            }
+          }
+        }
+
+        static slot *add_reference(slot *s) {
+          if (s != nullptr) {
+            s->_rc++;
+          }
+          return s;
+        }
+
+        template <typename T>
+        static slot *store(const weak_gc_ptr<T> &wp) {
+          slot *s = obtain_free_slot();
+          s->_rc = 1;
+          s->_ptr = wp;
+          return s;
+        }
+
+        template <typename T>
+        static slot *store(const gc_ptr<T> &p) {
+          slot *s = obtain_free_slot();
+          s->_rc = 1;
+          s->_ptr = p;
+          return s;
+        }
+
+      };
     }
+
     template <typename T>
     class external_gc_ptr
     {
@@ -801,6 +1004,135 @@ namespace mpgc {
   struct gc_traits<external_gc_sub_ref<T>> {
     static_assert(ruts::fail_static_assert<T>(), "external_gc_sub_ref<T> is not GC-friendly");
   };
+
+  template <typename T>
+  class external_weak_gc_ptr
+  {
+    using iwt = inbound_pointers::inbound_weak_table;
+    using slot = iwt::slot;
+    using target_base = inbound_pointers::target_base;
+
+    mutable slot *_slot;
+
+  public:
+
+    constexpr external_weak_gc_ptr() noexcept : _slot{nullptr} {}
+    constexpr external_weak_gc_ptr(nullptr_t) noexcept : _slot{nullptr} {}
+    external_weak_gc_ptr(const external_weak_gc_ptr &other) noexcept
+      : _slot{iwt::add_reference(other._slot)}
+    {}
+    external_weak_gc_ptr(external_weak_gc_ptr &&other) noexcept
+      : _slot{std::move(other._slot)}
+    {
+      other._slot = nullptr;
+    }
+
+    template<typename U, typename = std::enable_if_t<std::is_assignable<T*&,U*>::value> >
+    external_weak_gc_ptr(external_weak_gc_ptr<U> &other) noexcept
+      : _slot{iwt::add_reference(other._slot)}
+    {}
+    template<typename U, typename = std::enable_if_t<std::is_assignable<T*&,U*>::value> >
+    external_weak_gc_ptr(external_weak_gc_ptr<U> &&other) noexcept
+      : _slot{std::move(other._slot)}
+    {
+      other._slot = nullptr;
+    }
+    
+
+    template<typename U, typename = std::enable_if_t<std::is_assignable<T*&,U*>::value> >
+    external_weak_gc_ptr(const weak_gc_ptr<U> &wp) noexcept
+      : _slot{iwt::store(wp)}
+    {}
+
+    template<typename U, typename = std::enable_if_t<std::is_assignable<T*&,U*>::value> >
+    external_weak_gc_ptr(const gc_ptr<U> &p) noexcept
+      : _slot{iwt::store(p)}
+    {}
+    template<typename U, typename = std::enable_if_t<std::is_assignable<T*&,U*>::value> >
+    external_weak_gc_ptr(const external_gc_ptr<U> &p) noexcept
+      : external_weak_gc_ptr{p.value()}
+    {}
+
+    ~external_weak_gc_ptr() noexcept {
+      if (_slot != nullptr) {
+        iwt::release_slot(_slot);
+        _slot = nullptr;
+      }
+    }
+    
+    external_weak_gc_ptr &operator =(const external_weak_gc_ptr &rhs) noexcept
+    {
+      slot *rhs_slot = rhs._slot;
+      if (rhs_slot != _slot) {
+        iwt::drop_reference(_slot);
+        _slot = iwt::add_reference(rhs_slot);
+      }
+      return *this;
+    }
+    external_weak_gc_ptr &operator =(external_weak_gc_ptr &&rhs) noexcept
+    {
+      iwt::drop_reference(_slot);
+      _slot = rhs._slot;
+      rhs._slot = nullptr;
+      return *this;
+    }
+    external_weak_gc_ptr &operator =(nullptr_t) noexcept
+    {
+      iwt::drop_reference(_slot);
+      _slot = nullptr;
+      return *this;
+    }
+
+    /*
+     * All of the rest of the assignment operators should work by
+     * creating a temporary via the ctors and doing a move assignment.
+     */
+
+    void reset() noexcept {
+      iwt::drop_reference(_slot);
+      _slot = nullptr;
+    }
+
+    gc_ptr<T> lock() const noexcept
+    {
+      using nc_target_base = std::remove_const_t<target_base>;
+      if (_slot == nullptr) {
+        return nullptr;
+      }
+      gc_ptr<target_base> sp = _slot->_ptr.lock();
+      if (sp == nullptr) {
+        iwt::drop_reference(_slot);
+        _slot = nullptr;
+      }
+      gc_ptr<nc_target_base> nc_sp = std::const_pointer_cast<nc_target_base>(sp);
+      return std::static_pointer_cast<T>(nc_sp);
+    }
+
+    void swap(external_weak_gc_ptr &rhs) noexcept {
+      std::swap(_slot, rhs._slot);
+    }
+
+    bool expired() const {
+      if (_slot == nullptr) {
+        if (_slot->_ptr.expired()) {
+          iwt::drop_reference(_slot);
+          _slot == nullptr;
+        }
+      }
+      return _slot == nullptr;
+    }
+    
+    template <typename C, typename Tr>
+    std::basic_ostream<C,Tr> &print_on(std::basic_ostream<C,Tr> &os) const {
+      if (_slot == nullptr) {
+        return os << offset_ptr<T>{};
+      } else {
+        return os << _slot->_ptr;
+      }
+    }
+
+    
+  };
 }
 
 namespace ruts {
@@ -830,6 +1162,12 @@ namespace std {
   
   template <typename C, typename T, typename X>
   basic_ostream<C,T> &
+  operator <<(basic_ostream<C,T> &os, const mpgc::external_weak_gc_ptr<X> &ptr) {
+    return ptr.print_on(os);
+  }
+  
+  template <typename C, typename T, typename X>
+  basic_ostream<C,T> &
   operator <<(basic_ostream<C,T> &os, const mpgc::external_gc_sub_ptr<X> &ptr) {
     return os << ptr.value();
   }
@@ -837,6 +1175,12 @@ namespace std {
   template <typename T>
   inline
   void swap(mpgc::external_gc_ptr<T> &lhs, mpgc::external_gc_ptr<T> &rhs) {
+    lhs.swap(rhs);
+  }
+
+  template <typename T>
+  inline
+  void swap(mpgc::external_weak_gc_ptr<T> &lhs, mpgc::external_weak_gc_ptr<T> &rhs) {
     lhs.swap(rhs);
   }
 

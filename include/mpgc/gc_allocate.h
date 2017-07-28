@@ -30,12 +30,16 @@
 #include <utility>
 #include <iterator>
 
-#include "mpgc/gc_allocator.h"
+#include "mpgc/gc_skiplist_allocator.h"
 #include "mpgc/gc_ptr.h"
 
 namespace mpgc {
-  extern void allocation_prologue();
-  extern void allocation_epilogue(void*, gc_token&, std::size_t);
+  namespace gc_handshake {
+    struct in_memory_thread_struct;
+  }
+
+  extern gc_handshake::in_memory_thread_struct& allocation_prologue();
+  extern void allocation_epilogue(gc_handshake::in_memory_thread_struct&, void*, gc_token&, std::size_t);
 
   class gc_managed_placement_t {};
   static const gc_managed_placement_t in_gc_managed_space;
@@ -55,14 +59,21 @@ namespace mpgc {
     gc_ptr<T> allocate(Args&&...args) {
       //      check_descriptor();
       gc_descriptor valdesc = desc_for<T>();
+      std::size_t vdsize = valdesc.object_size();
+      if (vdsize * 8 != sizeof(T)) {
+        std::cout << "Obj desc says "
+                  << vdsize << " words.  Obj is "
+                  << sizeof(T) << " bytes" << std::endl;
+        valdesc.trace(typeid(T).name());
+      }
       assert(valdesc.object_size()*8 == sizeof(T));
       gc_token tok(valdesc);
       static_assert(is_collectible<T>::value,
                     "Has non-trivial destructor and no is_collectible<T> specialization");
 
-      allocation_prologue();
-      void *ptr = gc_allocator::alloc(sizeof(T));
-      allocation_epilogue(ptr, tok, 0);
+      gc_handshake::in_memory_thread_struct& ts = allocation_prologue();
+      void *ptr = gc_allocator::alloc(ts, sizeof(T), alignof(T));
+      allocation_epilogue(ts, ptr, tok, 0);
 
       auto res = new (ptr) T(tok, std::forward<Args>(args)...);
       assert(&(res->get_gc_descriptor()) == ptr);
@@ -81,9 +92,9 @@ namespace mpgc {
       gc_allocator__<T>::check_descriptor();
     }
     
-    static void *allocate_space_for(size_type n) {
+    static void *allocate_space_for(gc_handshake::in_memory_thread_struct &ts, size_type n) {
       std::size_t sz = sizeof(gc_array_base)+n*sizeof(value_type);
-      return gc_allocator::alloc(sz);
+      return gc_allocator::alloc(ts, sz, alignof(T));
     }
 
     std::pair<void *, gc_token> allocate_(std::size_t n) 
@@ -93,9 +104,9 @@ namespace mpgc {
       gc_descriptor valdesc = desc_for<value_type>();
       gc_token tok(valdesc.in_array<value_type>(n));
 
-      allocation_prologue();
-      void *ptr = allocate_space_for(n);
-      allocation_epilogue(ptr, tok, n);
+      gc_handshake::in_memory_thread_struct& ts = allocation_prologue();
+      void *ptr = allocate_space_for(ts, n);
+      allocation_epilogue(ts, ptr, tok, n);
       return std::make_pair(ptr, tok);
     }
 
@@ -188,15 +199,15 @@ namespace mpgc {
 }
 
 inline
-void *operator new(std::size_t count, mpgc::gc_managed_placement_t) {
+void *operator new(std::size_t count, mpgc::gc_managed_placement_t) throw() {
   assert(false);
-  return mpgc::gc_allocator::alloc(count);
+  return nullptr;
 }
 
 inline
-void *operator new[](std::size_t count, mpgc::gc_managed_placement_t) {
+void *operator new[](std::size_t count, mpgc::gc_managed_placement_t) throw() {
   assert(false);
-  return mpgc::gc_allocator::alloc(count);
+  return nullptr;
 }
 
 

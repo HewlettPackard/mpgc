@@ -114,6 +114,10 @@ namespace mpgc {
        */
       auto old_begin = _rep.begin();
       auto new_rep = make_gc<rep_type>(c, old_begin, old_begin+_size);
+      // std::cout << "Grew vector rep to capacity " << c
+      //           << " (from " << capacity() << ")"
+      //           << ": " << new_rep << std::endl;
+
       // TODO: This should probably be atomic.
       _rep = new_rep;
     }
@@ -193,6 +197,11 @@ namespace mpgc {
               typename=std::enable_if_t<std::is_assignable<T*&,T2*>::value> >
     gc_basic_vector(const gc_basic_vector<T2,PC2> &other)
       : gc_basic_vector{other.begin(), other.end()} {}
+
+    gc_basic_vector(const gc_basic_vector &other)
+      : gc_basic_vector{other.begin(), other.end()} {}
+
+
     template <typename PC2>
     gc_basic_vector(gc_basic_vector<T,PC2> &&other)
       : _rep{std::move(other._rep)}, _size{other._size} {
@@ -200,28 +209,54 @@ namespace mpgc {
       other._rep = nullptr;
     }
 
-    gc_basic_vector(std::initializer_list<value_type> init) : gc_basic_vector{init.begin(), init.end()} {}
+    gc_basic_vector(gc_basic_vector &&other)
+      : _rep{std::move(other._rep)}, _size{other._size} {
+      other._size = 0;
+      other._rep = nullptr;
+    }
 
+    gc_basic_vector(std::initializer_list<value_type> init)
+      : gc_basic_vector{init.begin(), init.end()} {}
+
+
+    gc_basic_vector &operator =(const gc_basic_vector &other) {
+      // std::cout << "Assigning vector by copy" << std::endl;
+      assign(other.begin(), other.end());
+      return *this;
+    }
 
     template <typename T2, typename PC2,
               typename=std::enable_if_t<std::is_assignable<T*&,T2*>::value> >
     gc_basic_vector &operator =(const gc_basic_vector<T2,PC2> &other) {
+      // std::cout << "Assigning vector by copy" << std::endl;
       assign(other.begin(), other.end());
       return *this;
     }
+
     gc_basic_vector &operator =(std::initializer_list<value_type> init) {
       assign(init);
       return *this;
     }
 
-    template <typename PC2>
-    gc_basic_vector &operator =(gc_basic_vector<T,PC2> &&other) {
+    gc_basic_vector &operator =(gc_basic_vector &&other) {
+      // std::cout << "Assigning vector by move" << std::endl;
       _rep = std::move(other._rep);
       _size = other._size;
       other._size = 0;
       other._rep = nullptr;
       return *this;
     }
+
+    template <typename PC2>
+    gc_basic_vector &operator =(gc_basic_vector<T,PC2> &&other) {
+      // std::cout << "Assigning vector by move" << std::endl;
+      _rep = std::move(other._rep);
+      _size = other._size;
+      other._size = 0;
+      other._rep = nullptr;
+      return *this;
+    }
+
     reference at(size_type pos) {
       check_pos(pos);
       return (*this)[pos];
@@ -428,10 +463,12 @@ namespace mpgc {
     
     void push_back(const value_type &value) {
       resize(_size+1);
+      assert(back() == value_type{});
       back() = value;
     }
     void push_back(value_type &&value) {
       resize(_size+1);
+      assert(back() == value_type{});
       back() = std::move(value);
     }
     template <typename... Args>

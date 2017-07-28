@@ -89,7 +89,8 @@ public:
       using index_type = std::ptrdiff_t;
       using difference_type = std::ptrdiff_t;
       using iterator_category = std::random_access_iterator_tag;
-      using pointer = offset_ptr<value_type>;
+      //using pointer = offset_ptr<value_type>;
+      using pointer = value_type *;
     private:
       // TODO: Why isn't this a conditional type?
       gc_ptr<const gc_array<T>> _array;
@@ -127,9 +128,10 @@ public:
       {}
 
       static const auto &descriptor() {
-	gc_descriptor d =
+	static gc_descriptor d =
 	  GC_DESC(iter_)
-	  .template WITH_FIELD(&iter_::_array);
+	  .template WITH_FIELD(&iter_::_array)
+          .template WITH_FIELD(&iter_::_index);
         return d;
       }
       iter_ &operator =(const iter_ &) = default;

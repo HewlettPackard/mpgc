@@ -44,35 +44,138 @@
 #include <unordered_set>
 #include <vector>
 
+//#define TEST_WEAK_PTRS
+
 using namespace std;
 using namespace mpgc;
 
 class User;
 class Post;
-class Comment;
+
+class Comment : public gc_allocated {
+public:
+  const gc_ptr<User>                    commentor;
+  const gc_ptr<Post>                    parent;
+  const gc_string                       commentText;
+  const gc_array_ptr<gc_ptr<User>>      tagged;
+  gc_ptr<Comment>                       next;
+
+  Comment(gc_token &gc,
+          gc_ptr<User> cc = nullptr,
+          gc_ptr<Post> pp = nullptr,
+          string text = "i am a comment on a post",
+          gc_array_ptr<gc_ptr<User>> tags = nullptr)
+    : gc_allocated{gc}, commentor(cc), parent(pp), commentText(text), tagged(tags), next(nullptr) {}
+
+  static const auto &descriptor() {
+    static gc_descriptor d = 
+      GC_DESC(Comment)
+      .WITH_FIELD(&Comment::commentor)
+      .WITH_FIELD(&Comment::parent)
+      .WITH_FIELD(&Comment::commentText)
+      .WITH_FIELD(&Comment::tagged)
+      .WITH_FIELD(&Comment::next);
+    return d;
+  }
+};
+
+class Post : public gc_allocated {
+public:
+  const gc_ptr<User>                    poster;
+  const gc_string                       postText;
+  const gc_array_ptr<gc_ptr<User>>      tagged;
+  atomic<gc_array_ptr<gc_ptr<User>>>    subscribers;
+  atomic<gc_ptr<Comment>>               comments;
+
+  Post(gc_token &gc, string pp = "i am a default post")
+    : gc_allocated{gc},
+      poster(nullptr),
+      postText(pp),
+      tagged{make_gc_array<gc_ptr<User>>(0)},
+      subscribers{make_gc_array<gc_ptr<User>>(0)},
+      comments{nullptr}
+  {}
+
+  Post(gc_token &gc, gc_ptr<User> usr, string pp, const gc_array_ptr<gc_ptr<User>> &tags)
+    : gc_allocated{gc},
+      poster(usr),
+      postText(pp),
+      tagged{tags},
+      subscribers{make_gc_array<gc_ptr<User>>(1)},
+      comments{nullptr}
+  {
+    //We know that only the poster himself is the only subscriber at the time of creating the post.
+    auto localSubs = subscribers.load();
+    localSubs[0] = usr;
+  }
+
+  static const auto &descriptor() {
+    static gc_descriptor d = 
+      GC_DESC(Post)
+      .WITH_FIELD(&Post::poster)
+      .WITH_FIELD(&Post::postText)
+      .WITH_FIELD(&Post::tagged)
+      .WITH_FIELD(&Post::subscribers)
+      .WITH_FIELD(&Post::comments);
+    return d;
+  }
+
+  void addSubscriber(gc_ptr<User>);
+  size_t addSubscribers(const unordered_set<gc_ptr<User>>&);
+
+  size_t addComment(gc_ptr<Comment> c)
+  {
+    bool cas = false;
+    size_t count = 0;
+    gc_ptr<Comment> expected = comments;
+    do {
+      c->next = expected;
+      count++;
+      cas = comments.compare_exchange_weak(expected, c);
+    } while (!cas);
+    addSubscriber(c->commentor);
+    return count;
+    //  Dropping the pointer to the old array on the floor and letting the
+    //  garbage collector worry about the cleanup.
+  }
+};
 
 class User : public gc_allocated {
 private:
-  static atomic<unsigned long>& nextId() {
-    static atomic<unsigned long> _nextId(0);
-    return _nextId;
+  static unsigned long nextId() {
+    static atomic<unsigned long> _nextId(1);
+    return _nextId++;
   }
 
+#ifdef TEST_WEAK_PTRS
+  constexpr static std::size_t nr_posts = 64;
+  using post_ptr_t = weak_gc_ptr<Post>;
+#else
+  using post_ptr_t = gc_ptr<Post>;
+#endif
 public:
-  unsigned long id,
-                feedLength;
-  atomic<unsigned long> numTags; // number of times tagged in posts, even ones that fell off
+  const unsigned long id,
+                      feedLength;
+  atomic<unsigned long> numSubscribers; // number of times subscribed to posts, even ones that fell off
   gc_string name;
-  atomic<gc_array_ptr<gc_ptr<Post>>> feed;
+  atomic<gc_array_ptr<post_ptr_t>> feed;
+#ifdef TEST_WEAK_PTRS
+  atomic<size_t> oldest_post_idx;
+  const gc_array_ptr<gc_ptr<Post>> posts;
+#endif
   gc_vector<gc_ptr<User>>            friends;
 
   User(gc_token &gc, unsigned long fl = 200, string nm = "John Doe")
     : gc_allocated{gc},
-      id{nextId().fetch_add(1)},
+      id{nextId()},
       feedLength(fl),
-      numTags(0),
+      numSubscribers(0),
       name(nm),
-      feed{make_gc_array<gc_ptr<Post>>(0)},
+      feed{make_gc_array<post_ptr_t>(0)},
+#ifdef TEST_WEAK_PTRS
+      oldest_post_idx(0),
+      posts{make_gc_array<gc_ptr<Post>>(nr_posts)},
+#endif
       friends{gc_vector<gc_ptr<User>>()} {}
 
   static const auto &descriptor() {
@@ -80,9 +183,13 @@ public:
       GC_DESC(User)
       .WITH_FIELD(&User::id)
       .WITH_FIELD(&User::feedLength)
-      .WITH_FIELD(&User::numTags)
+      .WITH_FIELD(&User::numSubscribers)
       .WITH_FIELD(&User::name)
       .WITH_FIELD(&User::feed)
+#ifdef TEST_WEAK_PTRS
+      .WITH_FIELD(&User::oldest_post_idx)
+      .WITH_FIELD(&User::posts)
+#endif
       .WITH_FIELD(&User::friends);
     return d;
   }
@@ -95,22 +202,51 @@ public:
     return feed.load()->size() != 0;
   }
 
+#ifdef TEST_WEAK_PTRS
+  static bool weak_pred(const post_ptr_t &post) {
+    return !post.expired();
+  }
+#endif
+
   size_t pushToFeed(gc_ptr<Post> p) {
     bool cas = false;
-    size_t count = 0;
+    gc_array_ptr<post_ptr_t> newFeed = nullptr;
+
+    size_t count;
+#ifdef TEST_WEAK_PTRS
+    if (p->poster == this) {
+      count = oldest_post_idx++;
+      while (count >= nr_posts) {
+        count++;
+        oldest_post_idx.compare_exchange_strong(count, 0);
+        count = oldest_post_idx++;
+      }
+      posts[count] = p;
+    }
+#endif
+    count = 0;
+    gc_array_ptr<post_ptr_t> localFeed = feed;
     while (!cas) {
-      gc_array_ptr<gc_ptr<Post>> localFeed = feed;
-      bool isEmpty = localFeed.size() == 0;
-      bool isFull  = localFeed.size() >= feedLength;
-      auto newFeed = make_gc_array<gc_ptr<Post>>(min(localFeed.size() + 1, feedLength));
+      const bool   isEmpty = localFeed.size() == 0;
+      const bool   isFull  = localFeed.size() >= feedLength;
+      const size_t newSize = min(localFeed.size() + 1, feedLength);
+
+      if (newFeed.size() != newSize) {
+        newFeed = make_gc_array<post_ptr_t>(newSize);
+      }
+
       if (!isEmpty) {
-        copy(localFeed.begin() + (isFull ? 1 : 0),  // drop earliest post if full
-             localFeed.end(),
-             newFeed.begin());
+#ifdef TEST_WEAK_PTRS
+        copy_if(localFeed.begin() + (isFull ? 1 : 0),  // drop earliest post if full
+                localFeed.end(), newFeed.begin(), weak_pred);
+#else
+        copy(localFeed.begin() + (isFull ? 1 : 0),
+             localFeed.end(), newFeed.begin());
+#endif
       }
       newFeed->back() = p;
-      cas = feed.compare_exchange_strong(localFeed, newFeed);
       count++;
+      cas = feed.compare_exchange_strong(localFeed, newFeed);
     }
     return count;
   }
@@ -118,32 +254,57 @@ public:
   size_t bumpInFeed(gc_ptr<Post> p) {
     bool cas = false;
     size_t count = 0;
+    gc_array_ptr<post_ptr_t> newFeed = nullptr;
+    gc_array_ptr<post_ptr_t> localFeed = feed;
     while (!cas) {
-      gc_array_ptr<gc_ptr<Post>> localFeed = feed;
-      // If the post is the feed; bump it; otherwise add a new post.
-      auto i = find(localFeed.begin(), localFeed.end(), p);
-      bool isPostFound = i != localFeed.end();
-      gc_array_ptr<gc_ptr<Post>> newFeed;
-
+      // If the post is in the feed; bump it; otherwise add a new post.
+#ifdef TEST_WEAK_PTRS
+      bool isPostFound = false;
+      auto iter = localFeed.begin();
+      while (iter != localFeed.end()) {
+        gc_ptr<Post> temp = iter->lock();
+        if (temp == p) {
+          isPostFound = true;
+          break;
+        }
+        iter++;
+      }
+#else
+      auto iter = find(localFeed.begin(), localFeed.end(), p);
+      bool isPostFound = iter != localFeed.end();
+#endif
       if (isPostFound) {
         // Bump an existing post
-        newFeed = make_gc_array<gc_ptr<Post>>(localFeed.size());
-        auto it = copy(localFeed.begin(), i, newFeed.begin());  // [begin, i)
-        copy(i+1, localFeed.end(), it); // Skip the post
-        newFeed->back() = p;  // Add it back in at the end
+        if (newFeed.size() != localFeed.size()) {
+          newFeed = make_gc_array<post_ptr_t>(localFeed.size());
+        }
+#ifdef TEST_WEAK_PTRS
+        auto it = copy_if(localFeed.begin(), iter, newFeed.begin(), weak_pred);  // [begin, i)
+        copy_if(iter + 1, localFeed.end(), it, weak_pred); // Skip the post
+#else
+        auto it = copy(localFeed.begin(), iter, newFeed.begin());  // [begin, i)
+        copy(iter + 1, localFeed.end(), it); // Skip the post
+#endif
       }
       else {
         // Add a new post
-        bool isEmpty = localFeed.size() == 0;
-        bool isFull  = localFeed.size() >= feedLength;
-        newFeed = make_gc_array<gc_ptr<Post>>(min(localFeed.size() + 1, feedLength));
-        if (!isEmpty) {
-          copy(localFeed.begin() + (isFull ? 1 : 0),  // drop earliest post if full
-               localFeed.end(),
-               newFeed.begin());
+        const bool isEmpty = localFeed.size() == 0;
+        const bool isFull  = localFeed.size() >= feedLength;
+        const size_t newSize = min(localFeed.size() + 1, feedLength);
+        if (newFeed.size() != newSize) {
+          newFeed = make_gc_array<post_ptr_t>(newSize);
         }
-        newFeed->back() = p;
+        if (!isEmpty) {
+#ifdef TEST_WEAK_PTRS
+          copy_if(localFeed.begin() + (isFull ? 1 : 0),  // drop earliest post if full
+                  localFeed.end(), newFeed.begin(), weak_pred);
+#else
+          copy(localFeed.begin() + (isFull ? 1 : 0),  // drop earliest post if full
+                  localFeed.end(), newFeed.begin());
+#endif
+        }
       }
+      newFeed->back() = p;  // Add it back in at the end
       count++;
       cas = feed.compare_exchange_strong(localFeed, newFeed);
     }
@@ -151,103 +312,39 @@ public:
   }
 };
 
-class Post : public gc_allocated {
-public:
-  gc_string postText;
-  atomic<gc_array_ptr<gc_ptr<User>>>    tagged;
-  atomic<gc_array_ptr<gc_ptr<Comment>>> comments;
+void Post::addSubscriber(gc_ptr<User> u)
+{
+  bool cas = false;
+  while (!cas) {
+    gc_array_ptr<gc_ptr<User>> localSubs = subscribers;
+    unordered_set<gc_ptr<User>> s;
+    s.reserve(localSubs.size() + 1);
+    s.insert(localSubs.begin(), localSubs.end());
+    s.insert(u);
+    auto newSubs = make_gc_array<gc_ptr<User>>(s.begin(), s.end());
+    cas = subscribers.compare_exchange_strong(localSubs, newSubs);
+  }
+  u->numSubscribers++;
+}
 
-  Post(gc_token &gc, string pp = "i am a default post")
-    : gc_allocated{gc},
-      postText(pp),
-      tagged{make_gc_array<gc_ptr<User>>(0)},
-      comments{make_gc_array<gc_ptr<Comment>>(0)}
-  {}
+size_t Post::addSubscribers(const unordered_set<gc_ptr<User>> &newSubscribers)
+{
+  bool cas = false;
+  size_t count = 0;
+  while (!cas) {
+    gc_array_ptr<gc_ptr<User>> localSubs = subscribers;
+    unordered_set<gc_ptr<User>> s(newSubscribers);
+    s.insert(localSubs.begin(), localSubs.end());
 
-  Post(gc_token &gc, string pp, const unordered_set<gc_ptr<User>> &tags)
-    : gc_allocated{gc},
-      postText(pp),
-      tagged{make_gc_array<gc_ptr<User>>(tags.begin(), tags.end())},
-      comments{make_gc_array<gc_ptr<Comment>>(0)}
-  {}
-
-  static const auto &descriptor() {
-    static gc_descriptor d = 
-      GC_DESC(Post)
-      .WITH_FIELD(&Post::postText)
-      .WITH_FIELD(&Post::tagged)
-      .WITH_FIELD(&Post::comments);
-    return d;
+    auto newSubs = make_gc_array<gc_ptr<User>>(s.begin(), s.end());
+    cas = subscribers.compare_exchange_strong(localSubs, newSubs);
+    count++;
   }
 
-  void addTag(gc_ptr<User> u)
-  {
-    bool cas = false;
-    while (!cas) {
-      gc_array_ptr<gc_ptr<User>> localTagged = tagged;
-      unordered_set<gc_ptr<User>> s;
-      s.reserve(localTagged.size() + 1);
-      s.insert(localTagged.begin(), localTagged.end());
-      s.insert(u);
-      auto newTagged = make_gc_array<gc_ptr<User>>(s.begin(), s.end());
-      cas = tagged.compare_exchange_strong(localTagged, newTagged);
-    }
-    u->numTags++;
+  for (auto u : newSubscribers) {
+    u->numSubscribers++;
   }
-
-  size_t addTags(const unordered_set<gc_ptr<User>> &newTags)
-  {
-    bool cas = false;
-    size_t count = 0;
-    while (!cas) {
-      gc_array_ptr<gc_ptr<User>> localTagged = tagged;
-      unordered_set<gc_ptr<User>> s(newTags);
-      s.insert(localTagged.begin(), localTagged.end());
-
-      auto newTagged = make_gc_array<gc_ptr<User>>(s.begin(), s.end());
-      cas = tagged.compare_exchange_strong(localTagged, newTagged);
-      count++;
-    }
-
-    for (auto u : newTags) {
-      u->numTags++;
-    }
-    return count;
-  }
-
-  size_t addComment(gc_ptr<Comment> c)
-  {
-    bool cas = false;
-    size_t count = 0;
-    while (!cas) {
-      gc_array_ptr<gc_ptr<Comment>> localComments = comments;
-      auto newComments = make_gc_array<gc_ptr<Comment>>(localComments.size() + 1);
-      copy(localComments.begin(), localComments.end(), newComments.begin());
-      newComments->back() = c;
-      cas = comments.compare_exchange_strong(localComments, newComments);
-      count++;
-    }
-    return count;
-    //  Dropping the pointer to the old array on the floor and letting the
-    //  garbage collector worry about the cleanup.
-  }
-};
-
-class Comment : public gc_allocated {
-public:
-  gc_ptr<Post> parent;
-  gc_string    commentText;
-
-  Comment(gc_token &gc, gc_ptr<Post> pp = nullptr, string cc = "i am a comment on a post")
-    : gc_allocated{gc}, parent(pp), commentText(cc) {}
-
-  static const auto &descriptor() {
-    static gc_descriptor d = 
-      GC_DESC(Comment)
-      .WITH_FIELD(&Comment::parent)
-      .WITH_FIELD(&Comment::commentText);
-    return d;
-  }
-};
+  return count;
+}
 
 #endif /* GCDEMO_GRAPH_H */

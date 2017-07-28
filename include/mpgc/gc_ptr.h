@@ -1318,21 +1318,21 @@ namespace std {
   template <typename T, typename U>
   mpgc::gc_ptr<T>
   static_pointer_cast(const mpgc::gc_ptr<U> &r) {
-    return mpgc::gc_ptr_from_bare_ptr(static_cast<T*>(r._ptr));
+    return mpgc::gc_ptr<T>::from_offset_ptr(static_pointer_cast<T>(r._ptr));
   }
 
   template <typename T, typename U>
   inline
   mpgc::gc_ptr<T>
   dynamic_pointer_cast(const mpgc::gc_ptr<U> &r) {
-    return mpgc::gc_ptr_from_bare_ptr(dynamic_cast<T*>(r._ptr));
+    return mpgc::gc_ptr<T>::from_offset_ptr(dynamic_pointer_cast<T>(r._ptr));
   }
 
   template <typename T, typename U>
   inline
   mpgc::gc_ptr<T>
   const_pointer_cast(const mpgc::gc_ptr<U> &r) {
-    return mpgc::gc_ptr_from_bare_ptr(const_cast<T*>(r._ptr));
+    return mpgc::gc_ptr<T>::from_offset_ptr(const_pointer_cast<T>(r._ptr));
   }
 
   template <typename T>
@@ -1344,7 +1344,7 @@ namespace std {
 
   template <typename T>
   struct versioned_pointer_traits<mpgc::gc_ptr<T>>
-    : pointer_traits<mpgc::gc_ptr<T>>
+    : default_versioned_pointer_traits<mpgc::gc_ptr<T>>
   {
   private:
     using opvpt = versioned_pointer_traits<mpgc::offset_ptr<T>>;
@@ -1358,11 +1358,14 @@ namespace std {
       return opvpt::to_prim_rep(p.as_offset_pointer());
     }
     template <typename M, typename OV, typename NV>
-    static void modify(M&& mod, OV&& old_val, NV&&new_val) {
+    static void modify(const void *loc, M&& mod, OV&& old_val, NV&&new_val) {
       /*
        * old_val() can only be called before mod() is called.
        */
-      mpgc::write_barrier(forward<OV>(old_val)().as_offset_pointer(), forward<NV>(new_val)().as_offset_pointer(), mod);
+      mpgc::gc_ptr<T> new_v = forward<NV>(new_val)();
+      mpgc::write_barrier(forward<OV>(old_val)().as_offset_pointer(),
+                          new_v.as_offset_pointer(),
+                          [&new_v, mod=forward<M>(mod)] { return mod(new_v); });
     }
   };
 

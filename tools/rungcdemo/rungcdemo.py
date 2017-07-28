@@ -140,7 +140,12 @@ def main():
     print('========================================')
     sys.stdout.flush()
 
-    initStr = "./gcdemo-init" + \
+    hpcrunFlags = ' -e PAPI_TOT_CYC@10000000 '
+    hpcToolkitOutfile = ' -o gcdemo_measurements '
+    hpcToolkitLocation = '/data/gidra/HPCToolkit/hpctoolkit-install/bin/'
+    toolPrefix = hpcToolkitLocation + '/hpcrun ' + hpcrunFlags + hpcToolkitOutfile 
+
+    initStr = " ./gcdemo-init" + \
              (" -f" if args.forceClear else "") + \
               " -i " + str(args.iters) + \
               " -l " + str(args.feedLength) + \
@@ -149,7 +154,6 @@ def main():
              (" -s" if args.skipInit else "") + \
               " -t " + str(args.numProcesses * args.numThreads) + \
               " -u " + str(args.users)
-
     procStr = "./gcdemo" + \
              (" -b" if args.benchmark else "") + \
               " -C " + str(args.meanNumCommentTags) + \

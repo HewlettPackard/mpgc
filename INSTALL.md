@@ -43,8 +43,8 @@ For instructions on compiling MPGC as part of MDS, see:
     [https://github.com/HewlettPackard/mds/blob/master/INSTALL.md](https://github.com/HewlettPackard/mds/blob/master/INSTALL.md)
 
 To compile sources for MPGC standalone:
-- to build optimized, build under mpgc/build/intel-opt; 
-- to build debug, build under mpgc/build/intel-debug; e.g.
+- to build debug, build under mpgc/build/intel-debug;
+- to build optimized, build under mpgc/build/intel-opt; e.g.
 
     ```
     cd mpgc/build/intel-opt    
@@ -60,9 +60,12 @@ The build process compiles:
 
 The code common to both MDS and MPGC is compiled to libruts.a:
 where "ruts" stands for "Really Useful ToolS".
+For an optimized build, if the ruts build has completed successfully, this library will be created as: 
 
-To see if the build has completed successfully, 
-under the directory where the build was invoked, 
+    mpgc/ruts/build/intel-opt/libs/libruts.a    
+
+To see if the MPGC build has completed successfully, 
+under the directory where the build was invoked (e.g. mpgc/build/intel-opt),
 check for the existence of the following files: 
 
     libs/libmpgc.a    

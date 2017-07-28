@@ -42,6 +42,7 @@
 #include "ruts/cas_loop.h"
 #include "ruts/packed_word.h"
 #include "ruts/flag_set.h"
+#include "ruts/util.h"
 
 namespace ruts {
   template <typename Ptr, std::size_t NFlags, std::size_t N>
@@ -53,9 +54,13 @@ namespace std {
   template <typename Ptr>
   struct default_versioned_pointer_traits : pointer_traits<Ptr> {
     using prim_rep = typename pointer_traits<Ptr>::element_type*;
-    template <std::size_t NFlags, std::size_t N>
-    using vp_type = ruts::versioned<Ptr,NFlags,N>;
 
+    template <typename M>
+    constexpr static void construct_prim_rep(const void *loc,
+                                             const Ptr &p,
+                                             M&& mod) {
+      return;
+    }
     constexpr static Ptr from_prim_rep(prim_rep p) { return p;}
     constexpr static prim_rep to_prim_rep(Ptr p) { return p;}
 
@@ -78,11 +83,11 @@ namespace std {
      *           to one).
      */
     template <typename M, typename OV, typename NV>
-    static void modify(M&& mod, OV&& old_val, NV&&new_val) {
-      std::forward<M>(mod)();
+    static void modify(const void *loc, M&& mod, OV&& old_val, NV&&new_val) {
+      forward<M>(mod)(forward<NV>(new_val)());
     }
-    
-    
+
+    struct is_dereference_allowed : true_type {};
   };
 
   template <typename Ptr>
@@ -179,13 +184,16 @@ namespace ruts {
       operator pointer_value() const {
         return std::versioned_pointer_traits<pointer_value>::from_prim_rep(_ref);
       }
+      template <typename S = Ptr,
+                typename E = std::enable_if_t<std::versioned_pointer_traits<S>
+                                                 ::is_dereference_allowed::value>>
       element_type *operator->() const {
         return std::versioned_pointer_traits<pointer_value>::from_prim_rep(_ref).as_bare_pointer();
       }
       pointer_reference &operator =(const pointer_value &p) {
 	using traits = std::versioned_pointer_traits<Ptr>;
-	auto mod = [&]() {
-	  _ref = traits::to_prim_rep(p);
+	auto mod = [&](const pointer_value &ptr) {
+	  _ref = traits::to_prim_rep(ptr);
 	};
 	auto old_val = [this]() {
 	  return traits::from_prim_rep(_ref);
@@ -193,7 +201,7 @@ namespace ruts {
 	auto new_val = [&p]() {
 	  return p;
 	};
-	traits::modify(mod, old_val, new_val);
+	traits::modify(this, mod, old_val, new_val);
         return *this;
       }
 //      bool operator ==(const pointer_reference &rhs) const {
@@ -316,6 +324,11 @@ namespace ruts {
     versioned(const pointer_type &p, version_num v = version_num(), flags_value f = flags_value()) noexcept
     : _rep(v, f, std::versioned_pointer_traits<pointer_type>::to_prim_rep(p))
     {
+      std::versioned_pointer_traits<pointer_type>::construct_prim_rep(this, p,
+        [&](const pointer_type &ptr) {
+          _rep.set(v, f,
+                   std::versioned_pointer_traits<pointer_type>::to_prim_rep(ptr));
+        });
     }
 
 
@@ -352,12 +365,33 @@ namespace ruts {
       : versioned(v, flags_value::of(f.num(), flags.num()...))
       {}
 
+    template <typename S = Ptr, typename E = typename std::versioned_pointer_traits<S>::copy_ctor_behavior>
+    versioned(const versioned &v) noexcept : _rep(v._rep) {
+      E::doit(this, v,
+              [this](const pointer_type &p, const versioned &rhs) {
+                _rep.set(rhs.version(),
+                         rhs.flags(),
+                         std::versioned_pointer_traits<pointer_type>::to_prim_rep(p));
+              }
+      );
+    }
+
+    template <typename S = Ptr, typename E = typename std::versioned_pointer_traits<S>::copy_ctor_behavior>
+    versioned(versioned &&v) noexcept : _rep(std::move(v._rep)) {
+      E::doit(this, *this,
+              [this](const pointer_type &p, const versioned &rhs) {
+                _rep.set(rhs.version(),
+                         rhs.flags(),
+                         std::versioned_pointer_traits<pointer_type>::to_prim_rep(p));
+              }
+      );
+    }
 
     versioned &set(const pointer_type &p, version_num v, flags_value f) noexcept
     {
       using traits = std::versioned_pointer_traits<Ptr>;
-      auto mod = [&]() {
-	_rep.set(v, f, traits::to_prim_rep(p));
+      auto mod = [&](const pointer_type &ptr) {
+	_rep.set(v, f, traits::to_prim_rep(ptr));
       };
       auto old_val = [this]() {
 	return pointer();
@@ -365,7 +399,7 @@ namespace ruts {
       auto new_val = [&p]() {
 	return p;
       };
-      traits::modify(mod, old_val, new_val);
+      traits::modify(this, mod, old_val, new_val);
       return *this;
     }
 
@@ -457,7 +491,7 @@ namespace ruts {
 
     versioned &clear() {
       using traits = std::versioned_pointer_traits<Ptr>;
-      auto mod = [this]() {
+      auto mod = [this](const pointer_type &p) {
 	_rep.clear();
       };
       auto old_val = [this]() {
@@ -466,14 +500,15 @@ namespace ruts {
       auto new_val = []() {
 	return pointer_type{};
       };
-      traits::modify(mod, old_val, new_val);
+      traits::modify(this, mod, old_val, new_val);
 
       return *this;
     }
 
     template <typename CharT, typename Traits>
     friend std::basic_ostream<CharT, Traits> &operator <<(std::basic_ostream<CharT, Traits> &out, const versioned &vp) {
-      return out << vp._rep;
+      reset_flags_on_exit r(out);
+      return out << std::hex << vp._rep;
     }
 
     bool operator ==(const versioned &rhs) const {
@@ -629,7 +664,7 @@ namespace ruts {
       friend class flags_reference;
     public:
       operator bool() const {
-        return _avp.flag(_flag);
+        return _avp.vp().flag(_flag);
       }
       flag_reference &operator =(bool val) {
         _avp.set_flag(_flag, val);
@@ -734,6 +769,14 @@ namespace ruts {
       return version_reference(*this);
     }
 
+    explicit atomic_versioned(const versioned_ptr_type &vp)
+      : _atomic{vp}
+    {}
+
+    explicit atomic_versioned(nullptr_t)
+      : _atomic{nullptr}
+    {}
+    
     explicit atomic_versioned(const pointer_type &p = pointer_type{}, version_num v = version_num(), flags_value f = flags_value()) noexcept
         : _atomic(versioned_ptr_type{p, v, f})
           {}
@@ -775,13 +818,24 @@ namespace ruts {
       return cas_loop(_atomic, ufn);
     }
 
+    void fast_set(const versioned_ptr_type &to) {
+      _atomic = to;
+    }
+
     update_return set(const versioned_ptr_type &to) {
       return cas_loop(_atomic, [=](const versioned_ptr_type &){ return to; });
     }
 
+    update_return reset() {
+      return set(versioned_ptr_type{});
+    }
 
     update_return change(const versioned_ptr_type &from, const versioned_ptr_type &to) {
       return try_change_value(_atomic, from, to);
+    }
+
+    update_return reset_from(const versioned_ptr_type &from) {
+      return change(from, versioned_ptr_type{});
     }
 
     template <typename Update>
@@ -884,11 +938,28 @@ namespace ruts {
       });
     }
 
+    update_return set_pointer(const pointer_type &p) {
+      return set(p);
+    }
+
+    update_return reset_pointer() {
+      return set_pointer(pointer_type{});
+    }
+
     update_return change(const versioned_ptr_type &expected, const pointer_type &p) {
       return change_using(expected, [=](versioned_ptr_type vp) {
         return vp.set(p);
       });
     }
+
+    update_return change_pointer(const versioned_ptr_type &expected, const pointer_type &p) {
+      return change(expected, p);
+    }
+
+    update_return reset_pointer_from(const versioned_ptr_type &expected) {
+      return change(expected, pointer_type{});
+    }
+    
     update_return set(version_num v) {
       return update([=](versioned_ptr_type vp) {
         return vp.set(v);

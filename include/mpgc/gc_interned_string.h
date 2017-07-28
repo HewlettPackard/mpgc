@@ -38,6 +38,7 @@
 #include <memory>
 #include <string>
 #include <type_traits>
+#include <ostream>
 
 #include "ruts/uniform_key.h"
 #include "mpgc/gc.h"
@@ -79,10 +80,31 @@ namespace mpgc {
     const uniform_key &key() const {
       return id;
     }
+
+    template <typename ST>
+    std::basic_ostream<char,ST> &
+    print_on(std::basic_ostream<char,ST> &os) const {
+      for (char_type c : _value) {
+        os << static_cast<char>(c);
+      }
+      return os;
+    }
 //    const string_type &as_string() const {
 //      return _value;
 //    }
   };
+
+  template <typename SC, typename ST>
+  inline
+  std::basic_ostream<SC,ST> &
+  operator <<(std::basic_ostream<SC,ST> &os,
+              const gc_ptr<const keyed_string> &s)
+  {
+    if (s != nullptr) {
+      s->print_on(os);
+    }
+    return os;
+  }
 
   template <std::size_t Segments=10>
   class gc_interned_string_table : public gc_allocated {
@@ -109,7 +131,7 @@ namespace mpgc {
     static const auto &descriptor() {
       static gc_descriptor d =
 	GC_DESC(gc_interned_string_table)
-	.WITH_FIELD(&gc_interned_string_table::_map);
+	.template WITH_FIELD(&gc_interned_string_table::_map);
       return d;
     }
 
@@ -119,7 +141,7 @@ namespace mpgc {
       /*
        * Whatever the iterator, we want to treat it as if it's pointing to a char16_t;
        */
-      std::pair<masher::accumulator_type, masher::accumulator_type> accuruts = uniform_key::accumulators();
+      std::pair<masher::accumulator_type, masher::accumulator_type> accums = uniform_key::accumulators();
       for (char16_t c : ruts::range_over(from,to)) {
         accums.first.add(c);
         accums.second.add(c);

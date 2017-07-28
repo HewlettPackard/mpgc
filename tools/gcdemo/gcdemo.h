@@ -118,12 +118,25 @@ advanceProgressBar(const unsigned long current, const unsigned long max,
 
 }
 
+class RandomSeed {
+  mt19937 generator;
+  static unsigned int seed() {
+    static mt19937 s(random_device{}());
+    return s();
+  }
+public:
+  RandomSeed() : generator(RandomSeed::seed()) {}
+  unsigned int operator()() {
+    return generator();
+  }
+};
+
+extern thread_local RandomSeed random_seed;
 // Base class for creating all the other generators
 class RNG {
 protected:
-  random_device rd;
   mt19937 generator;
-  RNG() : generator{rd()} {}
+  RNG() : generator{random_seed()} {}
 };
 
 class UniformRNG : public RNG {

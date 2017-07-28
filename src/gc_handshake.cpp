@@ -46,6 +46,22 @@ namespace mpgc {
     thread_local thread_struct_handle thread_struct_handles;
     in_memory_thread_struct_list_type thread_struct_list;
 
+     thread_struct_handle::thread_struct_handle() {
+       gc_control_block &cb = control_block();
+       gc_status expected_status = Signum::sigInit;
+       /* We must ensure that handle is initialzed before thread_struct is inserted
+        * in the thread_struct_list from where the GC thread can pick it up and send
+        * a signal. This ordering ensures that the application thread is ready to
+        * receive signals before GC thread can do so.
+        * Therefore, we pass a reference to handle in the insert() function and
+        * initialize it there after construction.
+        */
+       thread_struct_list.insert(handle);
+       // We must set status_idx only if we haven't received a signal by that time.
+       handle->status_idx.compare_exchange_strong(expected_status, process_struct->get_gc_status());
+       handle->persist_data->slot = cb.bump_alloc_slots.acquire_slot();
+    }
+
     template <typename Fn, typename ...Args>
     static void process_stack(const std::size_t *start, const std::size_t *end, Fn&& func, Args&& ...args) {
       while (start < end) {
@@ -58,16 +74,35 @@ namespace mpgc {
       }
     }
 
-    void do_sweep_signal() {
-      in_memory_thread_struct &thread_struct = *thread_struct_handles.handle;
+    static void process_stack_weak_ptrs(in_memory_thread_struct &thread_struct,
+                                        std::size_t *start, std::size_t * const end) {
+      bool clear_signal = false;
+      /* We need to make signal clearing conditional as this function may be called while
+       * thread is inside lock/write_barrier.
+       */
+      if (thread_struct.weak_signal == Weak_signal::Working) {
+        thread_struct.weak_signal = Weak_signal::InBarrier;
+        clear_signal = true;
+      }
+      while (start < end) {
+        if (base_offset_ptr::could_be_offset_ptr(*start) && base_offset_ptr::is_weak(*start)) {
+          thread_struct.bitmap->cleanup_weak_ptr(start);
+        }
+        start++;
+      }
+      if (clear_signal) {
+        thread_struct.weak_signal = Weak_signal::Working;
+      }
+    }
 
+ /*   void do_sweep_signal(in_memory_thread_struct &thread_struct) {
       assert(thread_struct.status_idx.load().status() != Signum::sigInit);
       assert(thread_struct.status_idx.load().index() != process_struct->global_list_index());
       assert_current_alloc_list_empty();
 
       thread_struct.status_idx = gc_status(Signum::sigSweep, 1 - thread_struct.status_idx.load().index());
       thread_struct.local_free_list.clear();
-    }
+    }*/
 
     void hdl_sync(Signum sig) {
       in_memory_thread_struct &thread_struct = *thread_struct_handles.handle;
@@ -118,16 +153,20 @@ namespace mpgc {
       } else if (sig == Signum::sigInit) {
         thread_struct.status_idx = process_struct->get_gc_status();
       } else {
+        void *stack_addr = nullptr;
         assert(thread_struct.status_idx.load().index() != process_struct->global_list_index());
         assert_current_alloc_list_empty();
 
         thread_struct.status_idx = gc_status(Signum::sigSweep, 1 - thread_struct.status_idx.load().index());
+        process_stack_weak_ptrs(thread_struct,
+                                reinterpret_cast<std::size_t*>(&stack_addr),
+                                reinterpret_cast<std::size_t*>(thread_struct.stack_end));
         thread_struct.clear_local_allocator = true;
       }
     }
 
     void hdl_abrt(int sig, siginfo_t *siginfo, void *context) {
-      kill(0, SIGSTOP);
+      pthread_kill(pthread_self(), SIGSTOP);
     }
 
     void signal_hdl(int sig, siginfo_t *siginfo, void *context) {
@@ -144,6 +183,7 @@ namespace mpgc {
        hdl_async();
        break;
       case SIGNUM_TO_INT(Signum::sigSweep):
+      case SIGNUM_TO_INT(Signum::sigDeferredSweep):
        hdl_sweep();
        break;
       default:
@@ -174,6 +214,9 @@ namespace mpgc {
         if (sigaction(SIGABRT, &act, NULL) < 0) {
           std::abort();
         }
+    //    if (sigaction(SIGSEGV, &act, NULL) < 0) {
+      //    std::abort();
+        //}
       }
 
       if (thread_struct_list.head()) {
@@ -195,6 +238,11 @@ namespace mpgc {
 
       mpgc::Stage stage = cb.stage;
       process_struct->set_gc_status(cb.status.load().data);
+      /* If the other processes are in marking1 we enable mutators to sync with gc_thread
+       * using optimized mechanism. Otherwise it will be disabled.
+       */
+      marking_barrier_type local = cb.marking_barrier;
+      process_struct->gc_mutator_weak_sync = local._info.index == Barrier_indices::marking1 ? 0 : 1;
 
       //Create inbound pointer table before GC thread
       inbound_pointers::inbound_table::table(true);

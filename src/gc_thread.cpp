@@ -32,22 +32,22 @@
 #include "mpgc/gc.h"
 
 namespace mpgc {
-  namespace gc_handshake {
-    extern void do_sweep_signal();
-  }
 
   volatile bool request_gc_termination = false;
   static std::mutex gc_termination_mutex;
   static std::condition_variable gc_terminated;
 
   //Used by fault-tolerance code to determine which barrier will be the next one.
-  static const Barrier_indices next_barrier_index_mapping[Barrier_indices::arraysize] = {Barrier_indices::preSweep,
-                                                                                         Barrier_indices::preMarking,
-                                                                                         Barrier_indices::marking1,
-                                                                                         Barrier_indices::sweep1,
-                                                                                         Barrier_indices::sweep2,
-                                                                                         Barrier_indices::postSweep,
-                                                                                         Barrier_indices::sync};
+  static const Barrier_indices
+     next_barrier_index_mapping[Barrier_indices::arraysize + 1]
+                                  = {Barrier_indices::preMarking,
+                                     Barrier_indices::marking1,
+                                     Barrier_indices::sweep1,
+                                     Barrier_indices::sweep2,
+                                     Barrier_indices::postSweep1,
+                                     Barrier_indices::postSweep2,
+                                     Barrier_indices::sync,
+                                     Barrier_indices::preSweep};
 
   /*
    * Structure to be used by the cleanup functions which loop over processes
@@ -67,22 +67,41 @@ namespace mpgc {
    * This is needed as otherwise a thread, which has deferred sweep signal, will never allow
    * sweep to progress, and will loop forever in the global allocator.
    */
-  void global_allocation_epilogue() {
-    gc_handshake::in_memory_thread_struct &thread_struct = *gc_handshake::thread_struct_handles.handle;
-
+  void global_allocation_epilogue(gc_control_block& cb, gc_handshake::in_memory_thread_struct& thread_struct) {
     /* We should continue to defer sweep signal until allocation_epilogue() is invoked.
      * This is to avoid any race that may arise otherwise.
      */
+    thread_struct.sweep_signal_disabled = false;
     if (thread_struct.sweep_signal_requested) {
       thread_struct.sweep_signal_requested = false;
-      gc_handshake::do_sweep_signal();
+      gc_handshake::do_deferred_sweep_signal(thread_struct);
     }
+    thread_struct.sweep_signal_disabled = true;
+
+    if (thread_struct.clear_local_allocator) {
+      thread_struct.clear_local_allocator = false;
+      thread_struct.local_free_list.clear();
+    }
+    /*
+     * We had the worker threads performing sweep1, but we were seeing
+     * a situation in which after they decided they were in sweep, the
+     * GC thread changed to tracing, and this was causing them to read
+     * the wrong bitmap, with disastrous results.  So we're turning it
+     * off for now until we can figure out the correct logic.
+     */
+    // gc_status status_idx = thread_struct.status_idx;
+    // if (status_idx.status_idx.status == gc_handshake::Signum::sigSweep &&
+    //     gc_handshake::process_struct->sweep1_enabled) {
+    //   thread_struct.bitmap->sweep1_phase(cb, thread_struct.persist_data->expansion_slot,
+    //                                      thread_struct.rand, status_idx.status_idx.idx,
+    //                                      status_idx.status_idx.idx, true);
+    // }
   }
 
   /*
    * This function is called before allocation to defer sweep signal.
    */
-  void allocation_prologue() {
+   gc_handshake::in_memory_thread_struct& allocation_prologue() {
     //Initialize the GC in the allocation path.
     initialize_thread();
 
@@ -93,13 +112,15 @@ namespace mpgc {
       thread_struct.clear_local_allocator = false;
       thread_struct.local_free_list.clear();
     }
+    return thread_struct;
   }
 
   /*
    * This function is called after the allocation and before construction.
    */
-  void allocation_epilogue(void *p, gc_token &tok, std::size_t array_element_count) {
-    gc_handshake::in_memory_thread_struct &thread_struct = *gc_handshake::thread_struct_handles.handle;
+  void allocation_epilogue(gc_handshake::in_memory_thread_struct& thread_struct, void *p,
+                           gc_token &tok, std::size_t array_element_count) {
+
     assert(thread_struct.status_idx.load().status() != gc_handshake::Signum::sigInit);
     gc_control_block &cb = control_block();
 
@@ -151,18 +172,20 @@ namespace mpgc {
     thread_struct.sweep_signal_disabled = false;
     if (thread_struct.sweep_signal_requested) {
       thread_struct.sweep_signal_requested = false;
-      gc_handshake::do_sweep_signal();
+      gc_handshake::do_deferred_sweep_signal(thread_struct);
     }
   }
 
+  void mark_bitmap::mark_gc_control_block() {
+    //For this to work gc_control_block must be the first thing on the heap.
+    _mark_end_first(0, (sizeof(gc_control_block) >> 3) - 1);
+  }
   /*
    * Function to capture root pointers, both, external_gc_ptrs and persistent roots.
    */
-  static void capture_global_roots(Traversal_queue &q) {
-    gc_control_block &cb = control_block();
+  static void capture_global_roots(gc_control_block &cb, Traversal_queue &q) {
     inbound_pointers::inbound_table::table(true)->for_each_slot([&q, &cb](const offset_ptr<const gc_allocated> p) {
       if (p.is_valid() && !cb.bitmap.is_marked(p)) {
-        //q.push_front(p);
           q.push(p);
       }
     });
@@ -172,13 +195,21 @@ namespace mpgc {
           if (r != nullptr) {
             offset_ptr<const gc_allocated> p = r.as_offset_pointer();
             if (p.is_valid()  && !cb.bitmap.is_marked(p)) {
-              //q.push_front(p);
               q.push(p);
             }
           }
         });
-  }
 
+    cb.bump_alloc_slots
+      .enumerate_pointers([&q, &cb](const gc_ptr<const gc_allocated> &r) {
+          offset_ptr<const gc_allocated> p = r.as_offset_pointer();
+          if (p.is_valid()  && !cb.bitmap.is_marked(p)) {
+            q.push(p);
+          }
+        });
+
+    cb.bitmap.mark_gc_control_block();
+  }
   /*
    * The main function that marks black an object. It enumerates all the pointers in the object and
    * then marks it.
@@ -189,17 +220,17 @@ namespace mpgc {
     if (!p.is_valid() || cb.bitmap.is_marked(p) || !p->get_gc_descriptor().is_valid()) {
       return;
     }
-    p->get_gc_descriptor().for_each_ref([&q, &cb](const base_offset_ptr base_ptr) {
-      if (base_ptr.is_null()) {
-        return;
-      }
-      //nullptr are also invalid!
-      //assert(base_ptr.is_valid());
-      if (base_ptr.is_valid()) {
-        const offset_ptr<const gc_allocated> &ptr = static_cast<const offset_ptr<const gc_allocated>&>(base_ptr);
-	assert(ptr->get_gc_descriptor().is_valid());
-	if (ptr->get_gc_descriptor().is_valid() && !cb.bitmap.is_marked(ptr)) {
-	  //q.push_front(ptr);
+    p->get_gc_descriptor().for_each_ref([&q, &cb](const base_offset_ptr *base_ptr) {
+      const offset_ptr<const gc_allocated> ptr = *base_ptr;
+      if (!ptr.is_null()) {
+        assert(ptr.is_valid());
+        bool marked = cb.bitmap.is_marked(ptr);
+        if (ptr.is_weak()) {
+          if (!marked) {
+            cb.bitmap.mark_weak((std::size_t*)base_ptr);
+          }
+        } else if (!marked) {
+          assert(ptr->get_gc_descriptor().is_valid());
           q.push(ptr);
         }
       }
@@ -259,11 +290,11 @@ namespace mpgc {
 
   static void consume_dead_process_refs(per_process_struct &process_struct, Traversal_queue &my_q) {
     Traversal_queue &q = process_struct.traversal_queue();
-    Mark_buffer_list &mb_list = process_struct.mark_buffer_list();
-    Mbuf *m = mb_list.head();
+    Mutator_persist_list &mb_list = process_struct.mutator_persist_list();
+    Mpersist *m = mb_list.head();
     while (m) {
-      while (!m->is_empty()) {
-        m->process_element([&my_q] (const offset_ptr<const gc_allocated> &p) {
+      while (!m->mbuf.is_empty()) {
+        m->mbuf.process_element([&my_q] (const offset_ptr<const gc_allocated> &p) {
           my_q.push(p);
         });
       }
@@ -301,23 +332,23 @@ namespace mpgc {
       if (old_liveness.is_live == per_process_struct::Alive::Dead) {
         nr_dead_process++;
         continue;
-      } else if (binfo._info._barrier_idx == next_barrier_index_mapping[gc_handshake::process_struct->get_barrier_index()]) {
+      } else if (binfo._info.index == next_barrier_index_mapping[gc_handshake::process_struct->get_barrier_index()]) {
         return 0;
       } else if (per_process_struct::get_creation_time(old_liveness.pid) != old_liveness.creation_time) {
-        if (binfo._info._barrier_idx != gc_handshake::process_struct->get_barrier_index()) {
+        if (binfo._info.index != gc_handshake::process_struct->get_barrier_index()) {
           //The following commented code is required only if there is a possibility of the same barrier is used back-to-back.
           //proc.reset_barrier_info(proc.get_barrier_index());
           dead_action(p);
           nr_dead_process++;
           continue;
-        } else if (binfo._info._bstage == per_process_struct::Barrier_stage::unincremented) {
+        } else if (binfo._info.bstage == Barrier_stage::unincremented) {
           if (std::forward<Func>(cleanup_func)(p, old_liveness, std::forward<Args>(args)...)) {
             //The function is suppose to return true if dead process count must be incremented.
             nr_dead_process++;
           }
           continue;
-        } else if (binfo._info._bstage == per_process_struct::Barrier_stage::incrementing) {
-          barrier_id_dead_processes_t<per_process_struct*> &barrier_id_value = map[binfo._info._barrier.barrier];
+        } else if (binfo._info.bstage == Barrier_stage::incrementing) {
+          barrier_id_dead_processes_t<per_process_struct*> &barrier_id_value = map[binfo._info.barrier];
           if (barrier_id_value.found) {
             nr_dead_process++;
             dead_action(p);
@@ -328,9 +359,9 @@ namespace mpgc {
         }
       }
       //if it has incremented already, it should be accounted for.
-      if (binfo._info._bstage == per_process_struct::Barrier_stage::incremented &&
-          binfo._info._barrier_idx == gc_handshake::process_struct->get_barrier_index()) {
-        barrier_id_dead_processes_t<per_process_struct*> &barrier_id_value = map[binfo._info._barrier.barrier];
+      if (binfo._info.bstage == Barrier_stage::incremented &&
+          binfo._info.index == gc_handshake::process_struct->get_barrier_index()) {
+        barrier_id_dead_processes_t<per_process_struct*> &barrier_id_value = map[binfo._info.barrier];
         assert(!barrier_id_value.found);
         barrier_id_value.found = true;
         nr_dead_process += barrier_id_value.deque.size();
@@ -387,9 +418,9 @@ namespace mpgc {
       if (old_liveness.is_live == per_process_struct::Alive::Dead) {
         nr_dead_process++;
         continue;
-      } else if (binfo._info._barrier.version > gc_handshake::process_struct->get_barrier_version() ||
-                 (binfo._info._barrier.version == gc_handshake::process_struct->get_barrier_version() &&
-                  binfo._info._barrier_idx == Barrier_indices::marking2)) {
+      } else if (binfo._info.version > gc_handshake::process_struct->get_barrier_version() ||
+                 (binfo._info.version == gc_handshake::process_struct->get_barrier_version() &&
+                  binfo._info.index == Barrier_indices::marking2)) {
         return 0;
       } else if (per_process_struct::get_creation_time(old_liveness.pid) != old_liveness.creation_time) {
         per_process_struct &proc = *p;
@@ -399,8 +430,8 @@ namespace mpgc {
           bool ret = proc.set_liveness(desired, old_liveness);
           assert(ret);
         }
-        if (binfo._info._barrier.version < gc_handshake::process_struct->get_barrier_version() ||
-            (binfo._info._barrier_idx != Barrier_indices::marking1 && binfo._info._barrier_idx != Barrier_indices::marking2)) {
+        if (binfo._info.version < gc_handshake::process_struct->get_barrier_version() ||
+            (binfo._info.index != Barrier_indices::marking1 && binfo._info.index != Barrier_indices::marking2)) {
           //The following commented code is required only if there is
           //a possibility of the same barrier is used back-to-back.
 
@@ -415,19 +446,19 @@ namespace mpgc {
           }
           nr_dead_process++;
           continue;
-        } else if (binfo._info._barrier_idx == Barrier_indices::marking2) {
+        } else if (binfo._info.index == Barrier_indices::marking2) {
           assert(false);
         } else {
-          assert(binfo._info._barrier_idx == Barrier_indices::marking1);
-          assert(binfo._info._barrier.version == gc_handshake::process_struct->get_barrier_version());
-          if (binfo._info._bstage == per_process_struct::Barrier_stage::unincremented) {
+          assert(binfo._info.index == Barrier_indices::marking1);
+          assert(binfo._info.version == gc_handshake::process_struct->get_barrier_version());
+          if (binfo._info.bstage == Barrier_stage::unincremented) {
             if (!proc.mark_dead(old_liveness)) {
               return 0;
             }
             nr_dead_process++;
             continue;
-          } else if (binfo._info._bstage == per_process_struct::Barrier_stage::incrementing) {
-            barrier_id_dead_processes_t<map_pair> &barrier_id_value = map[binfo._info._barrier.barrier];
+          } else if (binfo._info.bstage == Barrier_stage::incrementing) {
+            barrier_id_dead_processes_t<map_pair> &barrier_id_value = map[binfo._info.barrier];
             if (barrier_id_value.found) {
               if (proc.mark_dead(old_liveness)) {
                 return 0;
@@ -442,12 +473,12 @@ namespace mpgc {
       }
 
       //if it has incremented already, it should be accounted for.
-      if (binfo._info._bstage == per_process_struct::Barrier_stage::incremented &&
-          binfo._info._barrier.version == gc_handshake::process_struct->get_barrier_version() &&
-          binfo._info._barrier_idx == Barrier_indices::marking1) {
+      if (binfo._info.bstage == Barrier_stage::incremented &&
+          binfo._info.version == gc_handshake::process_struct->get_barrier_version() &&
+          binfo._info.index == Barrier_indices::marking1) {
         //For processes with version < our version, consider it as unincremented and hence don't do
         //anything, just continue to next process.
-        barrier_id_dead_processes_t<map_pair> &barrier_id_value = map[binfo._info._barrier.barrier];
+        barrier_id_dead_processes_t<map_pair> &barrier_id_value = map[binfo._info.barrier];
         assert(!barrier_id_value.found);
         barrier_id_value.found = true;
         nr_dead_process += barrier_id_value.deque.size();
@@ -461,13 +492,13 @@ namespace mpgc {
       }
     } while (true);
 
-    marking1_barrier_t curr_barrier_count = cb.marking1_barrier;
+    marking_barrier_type curr_barrier_count = cb.marking_barrier;
     while (!map.empty()) {
       barrier_id_dead_processes_t<map_pair> &barrier_id_value = map.begin()->second;
       if (!barrier_id_value.found) {
         assert(barrier_id_value.deque.size() > 0);
         nr_dead_process += barrier_id_value.deque.size() - 1;
-        if (map.begin()->first == curr_barrier_count.barrier) {
+        if (map.begin()->first == curr_barrier_count._info.barrier) {
           nr_dead_process++;
           while(!barrier_id_value.deque.empty()) {
             map_pair &pair = barrier_id_value.deque.front();
@@ -512,257 +543,654 @@ namespace mpgc {
   static void marking_phase(per_process_struct &process_struct) {
     gc_control_block &cb = control_block();
     Traversal_queue &q = process_struct.traversal_queue();
-    Mark_buffer_list &mb_list = process_struct.mark_buffer_list();
-    marking1_barrier_t local_marking1_barrier;
+    gc_handshake::in_memory_thread_struct_list_type &thread_list = gc_handshake::thread_struct_list;
+
+    marking_barrier_type local_barrier;
     versioned_pcount_t nr_live_process;
-    pcount_t curr_version;
+    std::size_t iter = 0;
+    uint32_t curr_version = 0;
+    uint16_t weak_stage_ver = 0;
     bool clean = false;
+    bool do_handshake = false;
     uint8_t spin_count;
 
-    do {
-      process_struct.reset_barrier_info(Barrier_indices::marking1);
-      do {
-        if (request_gc_termination) {
-          return;
+    constexpr auto version_bits_fld = bits::field<uint16_t, uint16_t>(2, 14);
+    constexpr auto stage_bits_fld = bits::field<Weak_stage, uint16_t>(0, 2);
+    while (true) {
+      while (!clean) {
+        if (iter++ > 0) {
+          if (process_struct.gc_mutator_weak_sync == 1) {
+            //If gc_mutator_weak_sync is <0, stop> then change it to <0, work>.
+            process_struct.gc_mutator_weak_sync = 0;
+          }
+          uint16_t expected = stage_bits_fld.encode(Weak_stage::Repeat) |
+                              version_bits_fld.encode(weak_stage_ver);
+          uint16_t desired = stage_bits_fld.replace(expected, Weak_stage::Trace);
+
+          while (stage_bits_fld.decode(expected) == Weak_stage::Repeat &&
+                 !cb.weak_stage.compare_exchange_strong(expected, desired)) {
+            weak_stage_ver = version_bits_fld.decode(expected);
+            desired = stage_bits_fld.replace(expected, Weak_stage::Trace);
+          }
+          do_handshake = true;
         }
-        while (!clean) {
-          clean = true;
-          Mbuf *m = mb_list.head();
-          while (m) {
-            while (!m->is_empty()) {
-              clean = false;
-              m->process_element(mark_black, cb, q);
-              if (request_gc_termination) {
-                return;
+	process_struct.reset_barrier_info(Barrier_indices::marking1);
+	while (true) {
+	  if (request_gc_termination) {
+	    return;
+	  }
+	  while (!clean) {
+	    clean = true;
+            gc_handshake::in_memory_thread_struct *t = thread_list.head();
+	    while (t) {
+              if (do_handshake) {
+                gc_handshake::Weak_signal expected_weak_signal = gc_handshake::Weak_signal::InBarrier;
+                t->weak_signal.compare_exchange_strong(expected_weak_signal, gc_handshake::Weak_signal::DoHandshake);
               }
-            }
-            m = mb_list.next(m);
-          }
-          empty_collector_stack(cb, process_struct, q);
-        }
-        // Let's help others.
-        if (!help_other_processes(cb, process_struct, q)) {
-          // Nobody needed help.
-          break;
-        }
-        /* Spent some time helping others. Let's check again if
-         * some mutator(s) have unfinished business.
-         */
-      } while(true);
+	      Mbuf *m = &t->persist_data->mbuf;
+	      while (!m->is_empty()) {
+		clean = false;
+		m->process_element(mark_black, cb, q);
+		if (request_gc_termination) {
+		  return;
+		}
+	      }
+	      t = thread_list.next(t);
+	    }
+            do_handshake = false;
+	    empty_collector_stack(cb, process_struct, q);
+	  }
+	  // Let's help others.
+	  if (!help_other_processes(cb, process_struct, q)) {
+	    // Nobody needed help.
+	    break;
+	  }
+	  /* Spent some time helping others. Let's check again if
+	   * some mutator(s) have unfinished business.
+	   */
+	} //while(true)
 
-      spin_count = 0;
+	spin_count = 0;
+	assert(clean);
+	if (request_gc_termination) {
+	  return;
+	}
+
+	{
+	  marking_barrier_type &desired = local_barrier;
+	  marking_barrier_type &expected = process_struct.marking_barrier_ref();
+	  expected = cb.marking_barrier;
+	  assert(expected._info.bstage == Barrier_stage::incrementing);
+	  curr_version = expected._info.version;
+	  do {
+	    //assert(desired.barrier <= cb.total_process_count.load().count);
+	    assert(curr_version == expected._info.version);
+	    desired = expected;
+	    //This might happen if all existing processes moved to marking2 and then
+	    //a new process comes in and tries to increment marking1.
+	    if (expected._info.index == Barrier_indices::marking2) {
+              assert(iter == 1 && process_struct.gc_mutator_weak_sync == 1);
+              //We use the flag for something other than what the name reflects
+              //as it's needed only once.
+              do_handshake = true;
+	      break;
+	    }
+	    desired._info.barrier++;
+	  } while (!cb.marking_barrier.compare_exchange_weak(expected, desired));
+          if (!do_handshake) {
+            process_struct.set_barrier_incremented();
+          }
+	}
+
+	/* We don't need to check for stage == Stage::Tracing here
+	 * because there is no way that any GC thread goes past Marking2
+	 * barrier.
+	 */
+	nr_live_process = cb.total_process_count;
+	while (local_barrier._info.barrier < nr_live_process.count &&
+	       local_barrier._info.index == Barrier_indices::marking1 &&
+	       local_barrier._info.version == curr_version) {
+	  assert(cb.stage == Stage::Tracing);
+	  if (++spin_count == 0) {
+	    // First help others.
+	    if (!help_other_processes(cb, process_struct, q)) {
+	      // If nobody needed help, then check for failures.
+	      versioned_pcount_t temp_live_process(cleanup_marking_failures(cb, q), nr_live_process.version + 1);
+	      //temp_live_process = 0 indicates that termination has been requested.
+	      if (temp_live_process.count > 0 && cb.total_process_count.compare_exchange_strong(nr_live_process, temp_live_process)) {
+		nr_live_process = temp_live_process;
+	      }
+	      /* Set clean to false if work done. Otherwise, leave it as is.
+	       * It's important to have empty_collector_stack as the first
+	       * operand to && so that the function is called no matter what.
+	       */
+	      clean = !empty_collector_stack(cb, process_struct, q) && clean;
+	    } else {
+	      /* This needs some explanation! Consider a scenario where GC thread 1
+	       * after incrementing marking barrier 1 steals work from GC thread 2.
+	       * This may cause GC thread 2 to think that its work is done and hence
+	       * will increment marking barrier 1, which may meet the marking barrier 1's
+	       * criteria. Thereafter, GC thread 2 will check its mark-buffers, find them
+	       * empty and then increment marking barrier 2. At this time, GC thread 1
+	       * may be working on the stolen work. But during the same time, if some
+	       * mutator(s) in the GC thread 2's process update(s) a reference among
+	       * white references, it will cause references to be added to the mark-
+	       * buffer(s), which may go unnoticed because its GC thread is already
+	       * at marking barrier 2 and GC thread 1 will eventually finish the stolen
+	       * work, may find its mark-buffers empty, and hence increment the marking
+	       * barrier 2.
+	       *
+	       * To solve this, we make GC thread 1 pretend as if it found in its mark
+	       * buffers after exiting marking barrier 1. This will make all GC threads
+	       * to go back for another round of marking, when GC thread 2 will find
+	       * unprocessed references in marking buffers, if any.
+	       */
+	      clean = false;
+	    }
+	  }
+
+	  if (request_gc_termination) {
+	    return;
+	  }
+	  std::cpu_relax();
+	  nr_live_process = cb.total_process_count;
+	  local_barrier = cb.marking_barrier;
+	}
+
+	assert(q.empty());
+	process_struct.reset_barrier_info(Barrier_indices::marking2);
+	if (local_barrier._info.version != curr_version) {
+	  /* This indicates that somebody has already incremented the version.
+	   * We don't need to do anything now. Just continue.
+	   */
+	  clean = false;
+	  continue;
+	} else if (clean) {
+          uint16_t expected = 0;
+          if (process_struct.gc_mutator_weak_sync.compare_exchange_strong(expected, 1)) {
+            gc_handshake::in_memory_thread_struct *t = thread_list.head();
+	    while (t) {
+              while (t->weak_signal == gc_handshake::Weak_signal::DoHandshake) {
+                std::cpu_relax();
+              }
+              Mbuf *m = &t->persist_data->mbuf;
+	      if (!m->is_empty()) {
+	        clean = false;
+                //Not sure if we can exit immediately since there might still be some mutator(s)
+                //which have not yet handshaked.
+	        break;
+	      }
+              t = thread_list.next(t);
+	    }
+          } else if (!do_handshake) {
+            //Some mutator is in the read barrier right now. Go back
+            clean = false;
+          }
+	}
+
+	if (request_gc_termination) {
+	  return;
+	}
+
+	if (!clean) {
+	  marking_barrier_type desired(Barrier_stage::incrementing, Barrier_indices::marking1);
+	  desired._info.version = local_barrier._info.version + 1;
+	  assert(desired._info.barrier == 0);
+	  while (local_barrier._info.version != desired._info.version &&
+		 !cb.marking_barrier.compare_exchange_strong(local_barrier, desired));
+	} else {
+	  if (!do_handshake) {
+	    //First set the marking barrier to <marking2, ver, 0> from <marking1, ver, n>
+	    marking_barrier_type desired(Barrier_stage::incrementing, Barrier_indices::marking2);
+	    desired._info.version = local_barrier._info.version;
+	    assert(desired._info.barrier == 0);
+	    while (local_barrier._info.index != Barrier_indices::marking2 &&
+		   !cb.marking_barrier.compare_exchange_strong(local_barrier, desired)) {
+	      if (local_barrier._info.version != curr_version) {
+		clean = false;
+		break;
+	      }
+	    }
+	  }
+	  if (clean) {
+	    //Now we try to increment.
+	    marking_barrier_type &desired = local_barrier;
+	    marking_barrier_type &expected = process_struct.marking_barrier_ref();
+	    expected = cb.marking_barrier;
+	    assert(expected._info.bstage == Barrier_stage::incrementing);
+
+	    do {
+	      if (expected._info.version != curr_version) {
+		assert(expected._info.index == Barrier_indices::marking1);
+		process_struct.set_barrier_unincremented();
+		clean = false;
+		//Someone wants to go back to marking. Let's join him.
+		break;
+	      }
+	      assert(expected._info.index == Barrier_indices::marking2);
+	      desired = expected;
+	      desired._info.barrier++;
+	    } while (!cb.marking_barrier.compare_exchange_weak(expected, desired));
+	  }
+
+	  if (clean) {
+	    process_struct.set_barrier_incremented();
+	    spin_count = 0;
+	    while (local_barrier._info.barrier < cb.total_process_count.load().count &&
+                   //We need to check for this as the count may not match due to some new process, while
+                   //the last existing process might have already incremented and gone past Tracing stage.
+		   cb.stage == Stage::Tracing) {
+	      std::cpu_relax();
+	      local_barrier = cb.marking_barrier;
+              if (local_barrier._info.index == Barrier_indices::marking1) {
+                //Some other process has asked to go back to marking.
+                //There is nothing to fix, just return back to top.
+                clean = false;
+                break;
+	      } else if (++spin_count == 0) {
+		pcount_t temp_live_process = cleanup_failures([](per_process_struct *p) {return;},
+							      [](per_process_struct *p,
+								 per_process_struct::liveness &expected) {return true;});
+		if (temp_live_process > 0 && cb.total_process_count.load().count != temp_live_process) {
+		  //Someone died. We need to cleanup. Lets go do marking again.
+		  clean = false;
+		  marking_barrier_type desired(Barrier_stage::incrementing, Barrier_indices::marking1);
+		  desired._info.version = local_barrier._info.version + 1;
+		  assert(desired._info.barrier == 0);
+		  while (local_barrier._info.version != desired._info.version &&
+			 !cb.marking_barrier.compare_exchange_strong(local_barrier, desired));
+		}
+	      }
+	      if (request_gc_termination) {
+		return;
+	      }
+	    }
+	  }
+	}
+      } //while(!clean)
       assert(clean);
-      if (request_gc_termination) {
-        return;
-      }
-
-      {
-        marking1_barrier_t &desired = local_marking1_barrier;
-        marking1_barrier_t &expected = process_struct.marking1_barrier_ref();
-        process_struct.set_barrier_incrementing();
-        expected = cb.marking1_barrier;
-        curr_version = expected.version;
-        do {
-          desired = expected;
-          desired.barrier++;
-          //assert(desired.barrier <= cb.total_process_count.load().count);
-          assert(curr_version == expected.version);
-        } while (!cb.marking1_barrier.compare_exchange_weak(expected, desired));
-        process_struct.set_barrier_incremented();
-      }
-
-      /* We don't need to check for stage == Stage::Tracing here
-       * because there is no way that any GC thread goes past Marking2
-       * barrier.
-       */
-      nr_live_process = cb.total_process_count;
-      while (local_marking1_barrier.barrier < nr_live_process.count && local_marking1_barrier.version == curr_version) {
-        assert(cb.stage == Stage::Tracing);
-        if (++spin_count == 0) {
-          // First help others.
-          if (!help_other_processes(cb, process_struct, q)) {
-            // If nobody needed help, then check for failures.
-            versioned_pcount_t temp_live_process(cleanup_marking_failures(cb, q), nr_live_process.version + 1);
-            //temp_live_process = 0 indicates that termination has been requested.
-            if (temp_live_process.count > 0 && cb.total_process_count.compare_exchange_strong(nr_live_process, temp_live_process)) {
-              nr_live_process = temp_live_process;
-            }
-            /* Set clean to false if work done. Otherwise, leave it as is.
-             * It's important to have empty_collector_stack as the first
-             * operand to && so that the function is called no matter what.
-             */
-            clean = !empty_collector_stack(cb, process_struct, q) && clean;
-          } else {
-            /* This needs some explanation! Consider a scenario where GC thread 1
-             * after incrementing marking barrier 1 steals work from GC thread 2.
-             * This may cause GC thread 2 to think that its work is done and hence
-             * will increment marking barrier 1, which may meet the marking barrier 1's
-             * criteria. Thereafter, GC thread 2 will check its mark-buffers, find them
-             * empty and then increment marking barrier 2. At this time, GC thread 1
-             * may be working on the stolen work. But during the same time, if some
-             * mutator(s) in the GC thread 2's process update(s) a reference among
-             * white references, it will cause references to be added to the mark-
-             * buffer(s), which may go unnoticed because its GC thread is already
-             * at marking barrier 2 and GC thread 1 will eventually finish the stolen
-             * work, may find its mark-buffers empty, and hence increment the marking
-             * barrier 2.
-             *
-             * To solve this, we make GC thread 1 pretend as if it found in its mark
-             * buffers after exiting marking barrier 1. This will make all GC threads
-             * to go back for another round of marking, when GC thread 2 will find
-             * unprocessed references in marking buffers, if any.
-             */
-            clean = false;
-          }
-        }
-
-        if (request_gc_termination) {
-          return;
-        }
-        std::cpu_relax();
-        nr_live_process = cb.total_process_count;
-        local_marking1_barrier = cb.marking1_barrier;
-      }
-
-      assert(q.empty());
-      process_struct.reset_barrier_info(Barrier_indices::marking2);
-      if (local_marking1_barrier.version != curr_version) {
-        /* This indicates that somebody has already incremented the version.
-         * We don't need to do anything now. Just continue.
-         */
-        clean = false;
-        continue;
-      } else if (clean) {
-        for (Mbuf *m = mb_list.head(); m; m = mb_list.next(m)) {
-          if (!m->is_empty()) {
-            clean = false;
-            break;
-          }
-        }
-      }
-
-      if (request_gc_termination) {
-        return;
-      }
-
-      if (!clean) {
-        marking1_barrier_t desired;
-        desired.version = local_marking1_barrier.version + 1;
-        while (local_marking1_barrier.version != desired.version &&
-               !cb.marking1_barrier.compare_exchange_strong(local_marking1_barrier, desired));
+      //do the stage cas here to claim that tracing is done.
+      uint16_t expected_weak_stage = stage_bits_fld.encode(Weak_stage::Trace) |
+                                     version_bits_fld.encode(weak_stage_ver);
+      weak_stage_ver++;
+      if (cb.weak_stage.compare_exchange_strong(expected_weak_stage,
+                                                stage_bits_fld.encode(Weak_stage::Clean) |
+                                                version_bits_fld.encode(weak_stage_ver)) ||
+          stage_bits_fld.decode(expected_weak_stage) == Weak_stage::Clean) {
+        break;
       } else {
-        spin_count = 0;
-        inc_barrier(process_struct, Barrier_indices::marking2);
-        while (cb.barrier_sync[Barrier_indices::marking2] < cb.total_process_count.load().count && cb.stage == Stage::Tracing) {
-          std::cpu_relax();
-          local_marking1_barrier = cb.marking1_barrier;
-          if (local_marking1_barrier.version != curr_version) {
-            assert(local_marking1_barrier.barrier < cb.total_process_count.load().count);
-            clean = false;
-            cb.barrier_sync[Barrier_indices::marking2] = 0;
-            break;
-          } else if (++spin_count == 0) {
-            pcount_t temp_live_process = cleanup_failures([](per_process_struct *p) {return;},
-                                                          [](per_process_struct *p, 
-                                                             per_process_struct::liveness &expected) {return true;});
-            if (temp_live_process > 0 && cb.total_process_count.load().count != temp_live_process) {
-              //We are here because curr_version == local_marking1_barrier.version.
-              marking1_barrier_t desired;
-              desired.version = local_marking1_barrier.version + 1;
-              while (local_marking1_barrier.version != desired.version &&
-                     !cb.marking1_barrier.compare_exchange_strong(local_marking1_barrier, desired));
-            }
-          }
-          if (request_gc_termination) {
-            return;
-          }
-        }
+        //Some mutator beat us to changing stage to Repeat. Reset the marking barrier.    
+        marking_barrier_type desired(Barrier_stage::incrementing, Barrier_indices::marking1);
+        desired._info.version = local_barrier._info.version + 1;
+        assert(desired._info.barrier == 0);
+        while (local_barrier._info.version != desired._info.version &&
+               !cb.marking_barrier.compare_exchange_strong(local_barrier, desired));
+        //We need to reset clean to process another cycle.
+        clean = false;
       }
-    } while(!clean);
+    } //while(true)
     process_struct.reset_barrier_info(Barrier_indices::preSweep);
 
     assert(q.empty());
-    for (Mbuf *m = mb_list.head(); m; m = mb_list.next(m)) {
-      while (!m->is_empty()) {
-        m->process_element([&cb] (const offset_ptr<const gc_allocated> &p) {
+    Mutator_persist_list &mb_list = process_struct.mutator_persist_list();
+    for (Mpersist *m = mb_list.head(); m; m = mb_list.next(m)) {
+      while (!m->mbuf.is_empty()) {
+        m->mbuf.process_element([&cb] (const offset_ptr<const gc_allocated> &p) {
           assert(cb.bitmap.is_marked(p));
         });
       }
     }
   }
 
-  static void erase_gc_descriptors_from_free_chunk(offset_ptr<gc_allocated> begin,
-                                                   const offset_ptr<gc_allocated>::difference_type size_in_words) {
-    assert(sizeof(std::size_t) == sizeof(gc_allocated));
-    const offset_ptr<const gc_allocated> end = begin + size_in_words;
-    const std::size_t heap_size = base_offset_ptr::heap_size();
+  static void post_sweep_weak_ptr_sync(gc_control_block &cb, per_process_struct *proc) {
+    constexpr auto stage_bits_fld = bits::field<Weak_stage, uint16_t>(0, 2);
+    gc_handshake::in_memory_thread_struct_list_type &thread_list = gc_handshake::thread_struct_list;
+    bool should_check = false;
 
-    for (std::size_t size = 0; begin < end; begin += size) {
-      std::size_t *b = reinterpret_cast<std::size_t*>(begin.as_bare_pointer());
-      /*
-       * The following logic works because object_descriptor is structured such
-       * that it will be always greater than any possible object size.
-       */
-      if (*b > heap_size) {
-        size = begin->get_gc_descriptor().object_size();
-        *b = size << 3;
-      } else {
-        size = *b >> 3;
+    cb.weak_stage = stage_bits_fld.encode(Weak_stage::Normal);
+
+    gc_handshake::in_memory_thread_struct *t = thread_list.head();
+    while (t) {
+      gc_handshake::Weak_signal expected_weak_signal = gc_handshake::Weak_signal::InBarrier;
+      if (t->weak_signal.compare_exchange_strong(expected_weak_signal, gc_handshake::Weak_signal::DoHandshake)) {
+        should_check = true;
       }
-      assert(size != 0);
+      if (request_gc_termination) {
+        return;
+      }
+      t = thread_list.next(t);    
+    }
+
+    if (should_check) {
+      t = thread_list.head();
+      while (t) {
+        while (t->weak_signal == gc_handshake::Weak_signal::DoHandshake) {
+          if (request_gc_termination) {
+            return;
+          }
+          std::cpu_relax();
+        }
+        t = thread_list.next(t);
+      }
+    }
+  }
+
+  static void erase_gc_descriptors_from_free_chunk(std::size_t* begin,
+                                                   const std::size_t size) {
+    static_assert(sizeof(std::size_t) == sizeof(gc_allocated),
+                  "sizeof gc_allocated larger than size_t");
+    const std::size_t * const end = begin + size;
+
+    gc_control_block &cb = control_block();
+    for (std::size_t s = 0; begin < end; begin += s) {
+      const gc_descriptor &gc_desc
+            = reinterpret_cast<gc_allocated*>(begin)->get_gc_descriptor();
+      if (!gc_desc.is_illegal()) {
+        s = gc_desc.object_size();
+        *begin = s;
+      } else {
+        s = *begin;
+      }
+      assert(s != 0);
     }
     assert(begin == end);
   }
 
-  static void put_to_global(gc_allocator::globalListType& list, const std::size_t beg_word, const std::size_t size_in_bytes) {
-    if (size_in_bytes == 0) {
+  static void put_to_global(gc_allocator::skiplist& list, chunk_expansion_slot &slot,
+                            const std::size_t beg_word, const std::size_t size,
+                            std::mt19937 &rand) {
+    /*
+     * There are 2 ways that we can get a free chunk smaller than global_chunk (or local_chunk).
+     * 1) If the chunk happens to be the first word of an expanded chunk for which we intentionally
+     * left the first word, and instead marked the second word. In this case, we can return as this
+     * free chunk is already added to the allocator as part of the expanded chunk.
+     *
+     * 2) If the chunk was left unused by allocator due to allocation request being just one word
+     * smaller than the allocation chunk, then also we don't need to do anything as the allocator
+     * ensures that the size of the chunk is already written there, which is very important for
+     * correct working of erase_gc_descriptors_from_free_chunk().
+     *
+     * So in any of the case, we can simply return without doing anything.
+     */
+    if (size < (sizeof(gc_allocator::global_chunk) >> 3)) {
       return;
     }
     std::size_t *begin = reinterpret_cast<std::size_t*>(base_offset_ptr::base()) + beg_word;
-    if (size_in_bytes < sizeof(gc_allocator::global_chunk)) {
-      *begin = size_in_bytes;
-      return;
-    }
-    erase_gc_descriptors_from_free_chunk(reinterpret_cast<gc_allocated*>(begin), size_in_bytes >> 3);
+    erase_gc_descriptors_from_free_chunk(begin, size);
+  
+    offset_ptr<gc_allocator::global_chunk> c = new (begin) gc_allocator::global_chunk(size);
 
-    gc_allocator::put_to_global(list, size_in_bytes,
-                                new (begin) gc_allocator::global_chunk(size_in_bytes));
+    std::atomic_signal_fence(std::memory_order_release);
+    slot.ptr = nullptr;
+
+    list.insert(control_block(), c, rand);
   }
 
-  void sweep1_phase() {
-    gc_control_block &cb = control_block();
-    gc_allocator::globalListType &other_list = cb.global_free_list[1 - gc_handshake::process_struct->global_list_index()];
-    Pre_sweep_list &pre_sweep_list = gc_handshake::process_struct->pre_sweep_list();
-    bool work_done = false;
-    assert(pre_sweep_list.empty());
-    for (uint8_t i = gc_allocator::global_list_size(); !work_done && i > 5; i--) {
-      do {
-        if (request_gc_termination) {
-          return;
+  bool mark_bitmap::expand_free_chunk(std::size_t *heap_begin,
+                                      offset_ptr<gc_allocator::global_chunk> c,
+                                      std::size_t size,
+                                      std::size_t &beg_word,
+                                      std::size_t &end_word) {
+    beg_word = c.offset() >> 3;
+    end_word = beg_word + size;
+
+    beg_word = find_prev_used_word(beg_word);
+    if (compute_bitmap_index(beg_word+1) >= _size) {
+      /*
+       * The chunk begins on the last word of the heap.  If we try to
+       * check the bitmap, we will index past the end.  In any case,
+       * the chunk is only one word long, which is too small to put in
+       * the allocator, so we ignore it and say we processed it.
+       */
+      return true;
+    }
+    
+    end_word = find_next_used_word(end_word, _size << value_log_bits);
+    //find_next_used_word returns the next used word. So we must decrement by 1.
+
+    /* Q: Why add 1 to beg_word?
+     * A: Because in case beg_word corresponds to a just collected object's
+     *    beginning and we are suppose to clear some weak_gc_ptr to this
+     *    object, then we will not be able to do so as the weak ptr clearing
+     *    logic works entirely on the check whether the corresponding object
+     *    is marked in the bitmaps or not.
+     *    In order to get around this, we mark the second word of the expanded
+     *    chunk, rather than the first one. Since all threads will try to do so,
+     *    it resolves the concurrency.
+     */
+    const bool is_not_obj = reinterpret_cast<gc_allocated*>(heap_begin + beg_word)->get_gc_descriptor().is_illegal();
+ 
+    std::atomic_signal_fence(std::memory_order_acquire);
+    if (is_marked(compute_bitmap_index(beg_word + 1), compute_bit_number(beg_word + 1))) {
+      return mark_end(compute_bitmap_index(end_word - 1), compute_bit_number(end_word - 1));
+    }
+    return _mark_begin_first(beg_word + (is_not_obj ? 0 : 1), end_word - 1);
+  }
+
+  void mark_bitmap::sweep1_phase(gc_control_block &cb,
+                                 chunk_expansion_slot &myslot,
+                                 std::mt19937 &rand,
+				 const uint8_t curr_idx,
+                                 const bool set_bitmap,
+                                 const bool expand_once) {
+    using namespace gc_allocator;
+    constexpr std::size_t threshold = 256;
+
+
+    skiplist &prev_list = cb.global_free_lists[1 - curr_idx];
+    skiplist &curr_list = cb.global_free_lists[curr_idx];
+
+    bump_chunk exp = prev_list.tail_node().bump_ptr;
+    std::size_t *bump_chunk_first_word
+           = reinterpret_cast<std::size_t*>(base_offset_ptr::base() +
+                                           (exp.begin << alignment_log));
+    std::size_t prev_size_bump_chunk = *bump_chunk_first_word;
+    
+    uint16_t iter = cb.expansion_slots_counter;
+    //first fill up the chunk expansion slots.
+    if (iter == 0) {
+      //Work on bump pointer first
+      prev_list.help_unfinished_bump_alloc();
+
+      bump_chunk exp = prev_list.tail_node().bump_ptr;
+      if (exp.begin != 0 && exp.end != 0) {
+        std::size_t end_word = key_fld.decode(prev_list.tail_node().level_orig_end);
+        offset_ptr<global_chunk> tail_chunk
+                   = reinterpret_cast<global_chunk*>(base_offset_ptr::base() +
+                                                    (exp.begin << alignment_log));
+        std::size_t size = end_word - exp.begin + 1;
+        reinterpret_cast<std::atomic<std::size_t>*>(bump_chunk_first_word)
+                   ->compare_exchange_strong(prev_size_bump_chunk, size);
+        while (iter < nr_slots) {
+          chunk_expansion_slot exp_slot(0, nullptr);
+          const chunk_expansion_slot des_slot(size, tail_chunk);
+          if (prev_list.expansion_slot_ref(iter++).compare_exchange_strong(exp_slot, des_slot) ||
+              (exp_slot.size == size && exp_slot.ptr == tail_chunk)) {
+            break;
+          }
         }
-        offset_ptr<gc_allocator::global_chunk> c = gc_allocator::get_chunk_from_global(other_list, i - 1);
-        if (c == nullptr) {
-          break;
+      }
+
+      prev_list.iterate_skipnodes([&cb] {return cb.expansion_slots_counter == 0;},
+                                  [&iter, &cb, &prev_list, threshold](const offset_ptr<const skip_node>& n) {
+        const std::size_t size = key_fld.decode(n->level_key);
+        if (size < threshold) {
+          return false;
         } else {
-          work_done = true;
+          for (offset_ptr<const global_chunk> exp = n->val_next.val.load();
+               exp != nullptr && iter < nr_slots;
+               exp = exp->next()) {
+            if (!exp.is_valid()) {
+              return false; 
+            }
+            chunk_expansion_slot exp_slot(0, nullptr);
+            const chunk_expansion_slot des_slot(size, exp);
+            if (!prev_list.expansion_slot_ref(iter++).compare_exchange_strong(exp_slot, des_slot) &&
+                (exp_slot.size != size || exp_slot.ptr != exp)) {
+              assert(cb.expansion_slots_counter > 0);
+              return false;
+            }
+          }
+          return iter < nr_slots;
         }
-        std::size_t beg_word, end_word;
-        if (cb.bitmap.expand_free_chunk(c, c->size(), beg_word, end_word)) {
-          /* We have to be carefull here. We are pushing beg_word and end_word as
-           * two different iteruts in the deque. But they are really meant for single
-           * operation. Therefore, while taking them out, firstly, the size of deque
-           * should be in multiples of two. And, secondly, two pop operations should
-           * be done from the other front to retrieve the beg_word and end_word in
-           * right order.
-           */
-          pre_sweep_list.push_back(beg_word);
-          pre_sweep_list.push_back(end_word);
+      });
+
+      //Fill rest of the slots with some non-understandable value.
+      if (cb.expansion_slots_counter == 0) {
+        while (iter < nr_slots) {
+          chunk_expansion_slot exp_slot(0, nullptr); 
+          const chunk_expansion_slot des_slot(std::size_t(~0), nullptr);
+          if (!prev_list.expansion_slot_ref(iter++).compare_exchange_strong(exp_slot, des_slot) &&
+              (exp_slot.size != std::size_t(~0) || exp_slot.ptr != nullptr)) {
+            std::abort();
+          }
         }
-      } while(true);
+      }
+    }
+
+    //Process chunks from expansion slots one by one.
+    iter = cb.expansion_slots_counter;
+    while (iter < nr_slots) {
+      myslot = prev_list.expansion_slot_ref(iter++);
+      if (myslot.ptr == nullptr) {
+        //There are no more expandable slots. Set counter to nr_slots and leave.
+        cb.expansion_slots_counter = nr_slots;
+        myslot.clear();
+        break;
+      }
+      uint16_t exp_slots_counter = iter - 1;
+      if (cb.expansion_slots_counter.compare_exchange_strong(exp_slots_counter, iter)) {
+        //I'm responsible for working on this slot now.
+        expand_and_put_chunk(cb, curr_list, myslot, set_bitmap, rand);
+        if (expand_once) {
+          myslot.clear();
+          break;
+        }
+      } else if (exp_slots_counter > iter) {
+        iter = exp_slots_counter;
+      }
+      myslot.clear();
     }
   }
 
-  void mark_bitmap::process_logical_chunk(gc_allocator::globalListType &list, const std::size_t nr_chunk, const bool set_bit) {
+  void mark_bitmap::expand_and_put_chunk(gc_control_block &cb,
+                                         gc_allocator::skiplist& curr_list,
+                                         chunk_expansion_slot &slot,
+                                         const bool set_bitmap,
+                                         std::mt19937 &rand) {
+    std::size_t *heap_begin = reinterpret_cast<std::size_t*>(base_offset_ptr::base());
+    constexpr auto flag_fld = bits::field<uint8_t, std::size_t>(63, 1);
+    std::size_t beg_word, end_word;
+    if (expand_free_chunk(heap_begin, slot.ptr, slot.size, beg_word, end_word)) {
+      slot.ptr = reinterpret_cast<gc_allocator::global_chunk*>(
+                      reinterpret_cast<std::size_t*>(base_offset_ptr::base()) + beg_word);
+      std::atomic_signal_fence(std::memory_order_release);
+      slot.size = flag_fld.encode(1) | (end_word - beg_word);
+      put_to_global(curr_list, slot, beg_word, end_word - beg_word, rand);
+
+      /* We can set all the bits within the chunk to be set as they will not
+       * have any dirty chunk.
+       */
+      if (!is_marked(compute_bitmap_index(beg_word), compute_bit_number(beg_word))) {
+        /* This is needed if, instead of the first word, we marked the second word because the
+         * the first word was beginning of a dead object. Read the comment in expand_free_chunk().
+         */
+        beg_word++;
+      }
+      set_sweep_bitmap_range(beg_word, end_word - 1, set_bitmap);
+    }
+  }
+
+  static void adjust_inbound_weak_pointers(gc_control_block &cb) {
+    inbound_pointers::inbound_weak_table::table(true)->for_each_slot([&cb](auto &wp) {
+      cb.bitmap.atomic_cleanup_weak_ptr(reinterpret_cast<size_t*>(&wp));
+    });
+  }
+
+  void mark_bitmap::atomic_cleanup_weak_ptr(std::size_t *p) {
+    constexpr auto ptr_fld = bits::field<std::size_t, std::size_t>(0, base_offset_ptr::used_bits());
+    std::atomic<std::size_t> *atomic = reinterpret_cast<std::atomic<std::size_t>*>(p);
+    std::size_t bare_exp = atomic->load();
+    base_offset_ptr exp = bare_exp;
+    assert(exp.is_null() || (exp.is_weak() && exp.is_valid()));
+    while (!exp.is_null() &&
+           !is_marked(&exp) &&
+           !atomic->compare_exchange_weak(bare_exp, ptr_fld.replace(bare_exp, 0))) {
+      exp = bare_exp;
+      assert(exp.is_null() || (exp.is_weak() && exp.is_valid()));
+    }
+  }
+
+  void mark_bitmap::cleanup_weak_ptr(std::size_t *p) {
+    constexpr auto ptr_fld = bits::field<std::size_t, std::size_t>(0, base_offset_ptr::used_bits());
+    base_offset_ptr *off_ptr = reinterpret_cast<base_offset_ptr*>(p);
+    assert(off_ptr->is_null() || (off_ptr->is_weak() && off_ptr->is_valid()));
+    if (!off_ptr->is_null() && !is_marked(off_ptr)) {
+      *p = ptr_fld.replace(*p, 0);
+    }
+  }
+
+  void mark_bitmap::verify_weak_ptr_cleanup(std::size_t *p) {
+    base_offset_ptr *ptr = reinterpret_cast<base_offset_ptr*>(p);
+    assert(ptr->is_null() || (ptr->is_weak() && ptr->is_valid() && is_marked(ptr)));
+  }
+
+  void mark_bitmap::cleanup_weak_ptrs(std::size_t begin, const std::size_t end) {
+    const bit_number_t begin_bit = compute_bit_number(begin);
+    bitmap_idx_t begin_idx = compute_bitmap_index(begin);
+    const bit_number_t end_bit = compute_bit_number(end);
+    const bitmap_idx_t end_idx = compute_bitmap_index(end);
+    assert(begin_idx < end_idx || (begin_idx == end_idx && begin_bit <= end_bit));
+    std::size_t * const base = reinterpret_cast<std::size_t*>(base_offset_ptr::base());
+
+    auto func = [this, base, end](rep_t val, std::size_t begin) {
+      while (val) {
+        std::size_t clz = __builtin_clzl(val);
+        assert(clz < bits_per_value);
+        //NOTE:Shifting 64-bit is undefined. So we don't B <<= clz + 1.
+        val <<= clz;
+        begin += clz;
+        atomic_cleanup_weak_ptr(base + begin);
+        assert(begin <= end);
+        begin++;
+        val <<= 1;
+      }
+    };
+
+    rep_t B = _weak[begin_idx] & construct_left_mask(begin_bit);
+    while (begin_idx < end_idx) {
+      func(B, begin_idx << value_log_bits);
+      B = _weak[++begin_idx];
+    }
+    //Now the last bitmap word.
+    func(B & construct_right_mask(end_bit), begin_idx << value_log_bits);
+  }
+
+  void mark_bitmap::verify_weak_ptrs_cleanup() {
+    bitmap_idx_t begin_idx = 0;
+    std::size_t * const base = reinterpret_cast<std::size_t*>(base_offset_ptr::base());
+
+    auto func = [this, base](rep_t val, std::size_t begin) {
+      while (val) {
+        std::size_t clz = __builtin_clzl(val);
+        assert(clz < bits_per_value);
+        //NOTE:Shifting 64-bit is undefined. So we don't B <<= clz + 1.
+        val <<= clz;
+        begin += clz;
+        verify_weak_ptr_cleanup(base + begin);
+        begin++;
+        val <<= 1;
+      }
+    };
+
+    rep_t B = _weak[begin_idx];
+    while (begin_idx < _size) {
+      func(B, begin_idx << value_log_bits);
+      B = _weak[++begin_idx];
+    }
+  }
+
+  void mark_bitmap::process_logical_chunk(gc_allocator::skiplist &list, const std::size_t nr_chunk, const bool set_bit) {
     std::size_t first = 0;
     const std::size_t end = (nr_chunk + 1) << (chunk_size_log_bits + value_log_bits);
     std::size_t second;
@@ -772,10 +1200,12 @@ namespace mpgc {
       if (second == end) {
         set_sweep_bitmap_both(0, set_bit);
         second = process_next_chunk_begin(1, set_bit);
-        put_to_global(list, first, (second - first) << 3);
+        put_to_global(list, gc_handshake::process_struct->get_sweep1_data(),
+                      first, second - first, gc_handshake::process_struct->rand);
         return;
       } else {
-        put_to_global(list, first, (second - first) << 3);
+        put_to_global(list, gc_handshake::process_struct->get_sweep1_data(),
+                      first, second - first, gc_handshake::process_struct->rand);
       }
     } else {
       second = nr_chunk << (chunk_size_log_bits + value_log_bits);
@@ -784,6 +1214,8 @@ namespace mpgc {
     bool dirty_end_bitmap = false;
     while (second < end) {
       first = find_next_free_word(second, end, dirty_end_bitmap);
+      //Go through weak-bitmap to fix weak ptrs from second to first.
+      cleanup_weak_ptrs(second, first - 1);
       if (first == end) {
         rep_t B = _end[((nr_chunk + 1) << chunk_size_log_bits) - 1];
         if (B & 0x1) {
@@ -798,7 +1230,8 @@ namespace mpgc {
           second = process_next_chunk_begin(nr_chunk + 1, set_bit);
         }
       }
-      put_to_global(list, first, (second - first) << 3);
+      put_to_global(list, gc_handshake::process_struct->get_sweep1_data(),
+                    first, second - first, gc_handshake::process_struct->rand);
     }
 
     if (!dirty_end_bitmap) {
@@ -846,29 +1279,7 @@ namespace mpgc {
     assert(gc_handshake::process_struct->get_tolerate_sweep_chunk() == 0);
     std::size_t &i = gc_handshake::process_struct->get_tolerate_sweep_chunk();
     gc_control_block &cb = control_block();
-    gc_allocator::globalListType &list = cb.global_free_list[gc_handshake::process_struct->global_list_index()];
-
-    {
-      Pre_sweep_list &pre_sweep_list = gc_handshake::process_struct->pre_sweep_list();
-      assert(pre_sweep_list.size() % 2 == 0);
-      while (!pre_sweep_list.empty()) {
-        std::size_t beg_word = pre_sweep_list.front();
-        pre_sweep_list.pop_front();
-      
-        std::size_t end_word = pre_sweep_list.front();
-        pre_sweep_list.pop_front();
-
-        put_to_global(list, beg_word, (end_word - beg_word) << 3);
-
-        if (request_gc_termination) {
-          return;
-        }
-        /* We can set all the bits within the chunk to be set as they will not
-         * have any dirty chunk.
-         */
-        cb.bitmap.set_sweep_bitmap_range(beg_word, end_word - 1, set_bitmap);
-      }
-    }
+    gc_allocator::skiplist &list = cb.global_free_lists[gc_handshake::process_struct->global_list_index()];
 
     do {
       if (request_gc_termination) {
@@ -882,16 +1293,12 @@ namespace mpgc {
         process_logical_chunk(list, i, set_bitmap);
       }
     } while (true);
-    //The following clearing of the other global allocator will not be required once we have the optimized sweep code.
-    gc_allocator::globalListType &other_list = cb.global_free_list[1 - gc_handshake::process_struct->global_list_index()];
-    for (uint8_t i = 0; i < gc_allocator::global_list_size(); i++) {
-      other_list[i].store(gc_allocator::list_head());
-      assert(other_list[i].load().empty());
-    }
   }
 
-  void mark_bitmap::_post_sweep_clear(atomic_rep_t &word, atomic_rep_t * bitmap_chunk, const bool set_bit) {
+  void mark_bitmap::_post_sweep_clear(atomic_rep_t &word, atomic_rep_t * bitmap_chunk,
+                                      atomic_rep_t * other_bitmap_chunk, const bool set_bit) {
     rep_t val = word;
+    bool is_other = other_bitmap_chunk != nullptr;
     rep_t iter = construct_bitmap_word(0);
     const std::size_t size = sizeof(atomic_rep_t) << chunk_size_log_bits;
     if (!set_bit) {
@@ -900,10 +1307,16 @@ namespace mpgc {
     while (iter) {
       if (!(val & iter)) {
         std::memset(bitmap_chunk, 0x0, size);
+        if (is_other) {
+          std::memset(other_bitmap_chunk, 0x0, size);
+        }
         set_sweep_bitmap(word, iter, set_bit);
       }
       iter >>= 1;
       bitmap_chunk += 1 << chunk_size_log_bits;
+      if (is_other) {
+        other_bitmap_chunk += 1 << chunk_size_log_bits;
+      }
     }
   }
 
@@ -916,8 +1329,8 @@ namespace mpgc {
     }
     assert(nr_sweep_bitmap_word < _sweep_bitmap_size);
     const std::size_t word_begin = nr_sweep_bitmap_word << (value_log_bits + chunk_size_log_bits);
-    _post_sweep_clear(_sweep_bitmap_begin[nr_sweep_bitmap_word], _begin + word_begin, set_bit);
-    _post_sweep_clear(_sweep_bitmap_end[nr_sweep_bitmap_word], _end + word_begin, set_bit);
+    _post_sweep_clear(_sweep_bitmap_begin[nr_sweep_bitmap_word], _begin + word_begin, _weak + word_begin, set_bit);
+    _post_sweep_clear(_sweep_bitmap_end[nr_sweep_bitmap_word], _end + word_begin, nullptr, set_bit);
   }
 
   void mark_bitmap::post_sweep_phase(per_process_struct *process_struct, const bool set_bit) {
@@ -936,58 +1349,60 @@ namespace mpgc {
     } while (true);
   }
 
-  static bool cleanup_sweep1_phase(per_process_struct *p, per_process_struct::liveness &expected) {
-    per_process_struct::liveness desired = gc_handshake::process_struct->get_liveness();
-    if (p->set_liveness(expected, desired)) {
-      Pre_sweep_list &dead_list = p->pre_sweep_list();
-      Pre_sweep_list &my_list = gc_handshake::process_struct->pre_sweep_list();
+  static void ensure_no_mutator_sweeping(per_process_struct *p) {
+    Mutator_persist_list &mb_list = p->mutator_persist_list();
 
-      /* If the size of dead_list is odd, that means the dead process couldn't
-       * push both begin and end. In that case, simply get rid of the begin that
-       * was pushed at the back.
-       *
-       * There are two scenarios in which the dead_list's size can be odd:
-       * 1) If the process to which dead_list belong, died after adding the
-       * beginning of the free range, but before adding the end of the range.
-       * In this case, we must throw away the back.
-       *
-       * 2) If some process was cleaning up the dead_list, but died after popping
-       * the beginning of a free range, but before popping the end. In this case,
-       * The front of the deque will be -1. In this case, throw away the front.
-       */
-      if (dead_list.size() % 2 != 0) {
-        if (dead_list.front() == std::size_t(-1)) {
-          dead_list.pop_front();
+    for (Mpersist *m = mb_list.head(); m; m = mb_list.next(m)) {
+      while (m->expansion_slot.ptr != nullptr) {
+        std::cpu_relax();
+      }
+    }
+  }
+
+  void mark_bitmap::_cleanup_sweep1_phase(per_process_struct *p, gc_allocator::skiplist &list, const bool set_bitmap) {
+    constexpr auto flag_fld = bits::field<uint8_t, std::size_t>(63, 1);
+    constexpr auto size_fld = bits::field<std::size_t, std::size_t>(0, 63);
+    chunk_expansion_slot *dead_slot_ptr = p->sweep1_data_ptr();
+    Mutator_persist_list &mb_list = p->mutator_persist_list();
+    Mpersist *mpersist = nullptr;
+    do {
+      chunk_expansion_slot &dead_slot = *dead_slot_ptr;
+      if (dead_slot.ptr != nullptr) {
+        assert(dead_slot.size != 0);
+        if (flag_fld.decode(dead_slot.size) == 1) {
+          std::size_t beg_word = dead_slot.ptr.offset() >> 3;
+          std::size_t end_word = size_fld.decode(dead_slot.size) + beg_word;
+          put_to_global(list, dead_slot, beg_word, size_fld.decode(dead_slot.size), gc_handshake::process_struct->rand);
+          /* We can set all the bits within the chunk to be set as they will not
+           * have any dirty chunk.
+           */
+          if (!is_marked(compute_bitmap_index(beg_word), compute_bit_number(beg_word))) {
+            /* This is needed if, instead of the first word, we marked the second word because the
+             * the first word was beginning of a dead object. Read the comment in expand_free_chunk().
+             */
+            beg_word++;
+          }
+          set_sweep_bitmap_range(beg_word, end_word - 1, set_bitmap);
         } else {
-          dead_list.pop_back();
+          expand_and_put_chunk(control_block(), list, dead_slot, set_bitmap, gc_handshake::process_struct->rand);
         }
       }
 
-      /* In the loop below, there is a very short window wherein we might have
-       * element next to the front one set to -1. At this point, if a process
-       * dies, we need a way to recover out of it. So, we throw away the first
-       * two elements.
-       */
-      if (dead_list.size() && dead_list[1] == std::size_t(-1)) {
-        dead_list.pop_front();
-        dead_list.pop_front();
+      mpersist = (mpersist == nullptr) ? mb_list.head() : mb_list.next(mpersist);
+
+      if (mpersist != nullptr) {
+        dead_slot_ptr = &mpersist->expansion_slot;
       }
+     
+    } while(mpersist != nullptr);
+  }
 
-      while (!dead_list.empty()) {
-        std::size_t first = dead_list[0];
-        std::size_t second = dead_list[1];
-
-        dead_list[1] = std::size_t(-1);
-        //The popping of elements should happen only after -1 assignment above.
-        std::atomic_signal_fence(std::memory_order_release);
-        dead_list.pop_front();
-        dead_list.pop_front();
-        //The pushing of the two elements must happen only after popping above.
-        std::atomic_signal_fence(std::memory_order_release);
-        my_list.push_back(first);
-        my_list.push_back(second);
-      }
-
+  static bool cleanup_sweep1_phase(per_process_struct *p, per_process_struct::liveness &expected, const bool set_bitmap) {
+    gc_control_block &cb = control_block();
+    gc_allocator::skiplist &list = cb.global_free_lists[gc_handshake::process_struct->global_list_index()];
+    per_process_struct::liveness desired = gc_handshake::process_struct->get_liveness();
+    if (p->set_liveness(expected, desired)) {
+      cb.bitmap._cleanup_sweep1_phase(p, list, set_bitmap);
       expected.is_live = per_process_struct::Alive::Dead;
       bool ret = p->set_liveness(desired, expected);
       assert(ret);
@@ -1034,6 +1449,7 @@ namespace mpgc {
       case Barrier_indices::preMarking:
       case Barrier_indices::preSweep:
       case Barrier_indices::sweep2:
+      case Barrier_indices::postSweep1:
         temp_live_process = cleanup_failures(action_on_dead_process,
                                              [](per_process_struct *p, per_process_struct::liveness &expected) -> bool {
             p->mark_dead();
@@ -1041,9 +1457,9 @@ namespace mpgc {
           });
         break;
       case Barrier_indices::sweep1:
-        temp_live_process = cleanup_failures(action_on_dead_process, cleanup_sweep1_phase);
+        temp_live_process = cleanup_failures(action_on_dead_process, cleanup_sweep1_phase, set_bit);
         break;
-      case Barrier_indices::postSweep:
+      case Barrier_indices::postSweep2:
         temp_live_process = cleanup_failures(action_on_dead_process, cleanup_post_sweep_phase, set_bit);
         break;
       default:
@@ -1071,11 +1487,7 @@ namespace mpgc {
    * Asserts during sweep signal that the new allocator list is completely empty.
    */
   void assert_current_alloc_list_empty() {
-    gc_allocator::globalListType &list =
-          control_block().global_free_list[1 - gc_handshake::thread_struct_handles.handle->status_idx.load().index()];
-    for (uint8_t i = 0; i < gc_allocator::global_list_size(); i++) {
-      assert(list[i].load().empty());
-    }
+    return;
   }
 
 
@@ -1139,9 +1551,7 @@ namespace mpgc {
           break;
         }
         //barriers used for marking can be cleaned at this point
-        cb.marking1_barrier = marking1_barrier_t();
-        cb.barrier_sync[Barrier_indices::marking2] = 0;
-
+        cb.marking_barrier = marking_barrier_type(Barrier_stage::incrementing, Barrier_indices::marking1);
         cb.stage.compare_exchange_strong(local_stage, Stage::preTracing);
         local_stage = Stage::preTracing;
       }
@@ -1153,6 +1563,7 @@ namespace mpgc {
         }
         cb.barrier_sync[Barrier_indices::preSweep] = 0;
         cb.barrier_sync[Barrier_indices::sweep1] = 0;
+        cb.expansion_slots_counter = 0;
 
         local_status.status_idx.status = gc_handshake::Signum::sigSync1;
         if (cb.status.compare_exchange_strong(local_status,
@@ -1167,7 +1578,8 @@ namespace mpgc {
         if (request_gc_termination) {
           break;
         }
-
+        //Enable mutators to sync in optimized manner with gc thread.
+        gc_handshake::process_struct->gc_mutator_weak_sync = 0;
         cb.stage.compare_exchange_strong(local_stage, Stage::Tracing);
         local_stage = Stage::Tracing;
       }
@@ -1178,7 +1590,8 @@ namespace mpgc {
           break;
         }
         cb.barrier_sync[Barrier_indices::sweep2] = 0;
-        cb.barrier_sync[Barrier_indices::postSweep] = 0;
+        cb.barrier_sync[Barrier_indices::postSweep1] = 0;
+        cb.barrier_sync[Barrier_indices::postSweep2] = 0;
         cb.bitmap.reset_logical_chunk_count();
 
         local_status.status_idx.status = gc_handshake::Signum::sigSync2;
@@ -1190,16 +1603,22 @@ namespace mpgc {
         gc_handshake::process_struct->set_gc_status(local_status.data);
         assert(gc_handshake::process_struct->get_gc_status() == cb.status.load().data);
 
-        gc_handshake::post_handshake(gc_handshake::Signum::sigAsync);
-        capture_global_roots(gc_handshake::process_struct->traversal_queue());
-        gc_handshake::wait_handshake(gc_handshake::Signum::sigAsync);
-        if (request_gc_termination) {
-          break;
-        }
-
-        marking_phase(*gc_handshake::process_struct);
-        if (request_gc_termination) {
-          break;
+        constexpr auto stage_bits_fld = bits::field<Weak_stage, uint16_t>(0, 2);
+        uint16_t expected = stage_bits_fld.encode(Weak_stage::Normal);
+        if (cb.weak_stage.compare_exchange_strong(expected,
+                                                  stage_bits_fld.encode(Weak_stage::Trace)) ||
+            stage_bits_fld.decode(expected) != Weak_stage::Clean) {
+          gc_handshake::post_handshake(gc_handshake::Signum::sigAsync, true);
+          capture_global_roots(cb, gc_handshake::process_struct->traversal_queue());
+          gc_handshake::wait_handshake(gc_handshake::Signum::sigAsync, true);
+          if (request_gc_termination) {
+            break;
+          }
+          //Main marking phase
+          marking_phase(*gc_handshake::process_struct);
+          if (request_gc_termination) {
+            break;
+          }
         }
         cb.barrier_sync[Barrier_indices::sync] = 0;
         //No synchronization required at this point as already done in marking_phase(process_struct)
@@ -1217,7 +1636,9 @@ namespace mpgc {
         gc_handshake::process_struct->set_gc_status(local_status.data);
         assert(gc_handshake::process_struct->get_gc_status() == cb.status.load().data);
 
-        gc_handshake::handshake(gc_handshake::Signum::sigSweep);
+        gc_handshake::post_handshake(gc_handshake::Signum::sigSweep, true);
+        adjust_inbound_weak_pointers(cb);
+        gc_handshake::wait_handshake(gc_handshake::Signum::sigSweep, true);
         if (request_gc_termination) {
           break;
         }
@@ -1232,8 +1653,15 @@ namespace mpgc {
           break;
         }
         cb.barrier_sync[Barrier_indices::preMarking] = 0;
+        gc_handshake::process_struct->sweep1_enabled = true;
 
-        sweep1_phase();
+        cb.bitmap.sweep1_phase(cb, gc_handshake::process_struct->get_sweep1_data(),
+                               gc_handshake::process_struct->rand,
+                               local_status.status_idx.idx,
+                               local_status.status_idx.idx, false);
+
+        gc_handshake::process_struct->sweep1_enabled = false;
+        ensure_no_mutator_sweeping(gc_handshake::process_struct);
 
         cb.stage.compare_exchange_strong(local_stage, Stage::Sweeping);
         local_stage = Stage::Sweeping;
@@ -1254,12 +1682,22 @@ namespace mpgc {
           break;
         }
 
+        post_sweep_weak_ptr_sync(cb, gc_handshake::process_struct);
+        if (request_gc_termination) {
+          break;
+        }
+
+        synchronize_gc_threads(Barrier_indices::postSweep1, local_stage, local_status.status_idx.idx);
+        if (request_gc_termination) {
+          break;
+        }
+
         cb.bitmap.post_sweep_phase(gc_handshake::process_struct, local_status.status_idx.idx);
         if (request_gc_termination) {
           break;
         }
 
-        synchronize_gc_threads(Barrier_indices::postSweep, local_stage, local_status.status_idx.idx);
+        synchronize_gc_threads(Barrier_indices::postSweep2, local_stage, local_status.status_idx.idx);
         if (request_gc_termination) {
           break;
         }
@@ -1269,6 +1707,8 @@ namespace mpgc {
         cb.stage.compare_exchange_strong(local_stage, Stage::Sweeped);
         local_stage = Stage::Sweeped;
 
+        cb.global_free_lists[gc_handshake::process_struct->global_list_index()].help_unfinished_bump_alloc();
+        cb.global_free_lists[1 - gc_handshake::process_struct->global_list_index()].reset();
         gc_handshake::thread_struct_list.deletion(gc_handshake::in_memory_thread_struct::is_marked);
         cb.process_struct_list.deletion(gc_handshake::process_struct, per_process_struct::is_marked);
         gc_handshake::process_struct->clear();
@@ -1289,6 +1729,15 @@ namespace mpgc {
       // finished marking.
       gc_cycle_num = cb.mem_stats.inc_cycle_num_to(gc_cycle_num+1);
     } //while(true)
+  }
+
+  mutator_persist::~mutator_persist() {
+    gc_control_block &cb = control_block();
+    gc_allocator::slot_number s = slot;
+    //We may leak a slot if the destructing process dies between the following 2 lines.
+    slot = 0;
+    cb.bump_alloc_slots.release_slot(s);
+    mbuf.~Mbuf();
   }
 
   /*

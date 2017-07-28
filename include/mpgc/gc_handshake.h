@@ -38,6 +38,7 @@
 #include <vector>
 #include <unordered_set>
 #include <cstdio>
+#include <random>
 
 #include <execinfo.h>
 #include <sys/types.h>
@@ -51,7 +52,7 @@
 
 #include "mpgc/mark_buffer.h"
 #include "mpgc/gc_thread.h"
-#include "mpgc/gc_allocator.h"
+#include "mpgc/gc_skiplist_allocator.h"
 
 namespace std {
   extern void cpu_relax();
@@ -69,8 +70,15 @@ namespace mpgc {
       sigAsync,
       sigDeferredAsync,
       sigSweep,
+      sigDeferredSweep,
       // More actions may come here.
       sigInit
+    };
+
+    enum class Weak_signal : char {
+      InBarrier,
+      DoHandshake,
+      Working
     };
 
     extern Signum *status_ptr;
@@ -107,10 +115,12 @@ namespace mpgc {
 
       gc_allocator::localPoolType local_free_list;
       const pthread_t pthread;
+      std::mt19937 rand;
       uint8_t * const stack_end;
-      mark_buffer<offset_ptr<const gc_allocated>> * const mbuffer;
+      mutator_persist * const persist_data;
       mark_bitmap * const bitmap;
       std::atomic<gc_status> status_idx;
+      std::atomic<Weak_signal> weak_signal;
       volatile Alive live;
       volatile bool mark_signal_disabled;
       volatile Signum mark_signal_requested;
@@ -134,10 +144,12 @@ namespace mpgc {
 
       in_memory_thread_struct() :
           pthread(pthread_self()),
-          stack_end(compute_stack_addr()),
-          mbuffer(process_struct->mark_buffer_list().insert()),
+          rand(pthread),
+          stack_end(compute_stack_addr(pthread)),
+          persist_data(process_struct->mutator_persist_list().insert()),
           bitmap(mbitmap),
           status_idx(gc_status(Signum::sigInit)),
+          weak_signal(Weak_signal::Working),
           live(Alive::Live),
           mark_signal_disabled(false),
           mark_signal_requested(Signum::sigInit),
@@ -147,7 +159,7 @@ namespace mpgc {
       {}
 
       ~in_memory_thread_struct() {
-        mbuffer->mark_dead();
+        persist_data->mbuf.mark_dead();
       }
 
     private:
@@ -156,12 +168,12 @@ namespace mpgc {
        * is first created. The possibility of the stack being
        * grown/shrink at runtime is not supported yet.
        */
-      uint8_t *compute_stack_addr() {
+      uint8_t *compute_stack_addr(pthread_t p) {
         void *stack_addr;
         std::size_t stack_size;
         pthread_attr_t attr;
 
-        pthread_getattr_np(pthread_self(), &attr);
+        pthread_getattr_np(p, &attr);
         pthread_attr_getstack(&attr, &stack_addr, &stack_size);
         pthread_attr_destroy(&attr);
         return reinterpret_cast<uint8_t*>(stack_addr) + stack_size;
@@ -179,19 +191,7 @@ namespace mpgc {
     struct thread_struct_handle {
       in_memory_thread_struct *handle;
 
-      thread_struct_handle() {
-        gc_status expected_status = Signum::sigInit;
-        /* We must ensure that handle is initialzed before thread_struct is inserted
-         * in the thread_struct_list from where the GC thread can pick it up and send
-         * a signal. This ordering ensures that the application thread is ready to
-         * receive signals before GC thread can do so.
-         * Therefore, we pass a reference to handle in the insert() function and
-         * initialize it there after construction.
-         */
-        thread_struct_list.insert(handle);
-        // We must set status_idx only if we haven't received a signal by that time.
-        handle->status_idx.compare_exchange_strong(expected_status, process_struct->get_gc_status());
-      }
+      thread_struct_handle();
 
       ~thread_struct_handle() { handle->mark_dead(); }
     };
@@ -276,8 +276,14 @@ namespace mpgc {
       }
     }
 
+    inline void do_deferred_sweep_signal(in_memory_thread_struct &thread_struct) {
+      pthread_sigqueue(thread_struct.pthread, SIGRTMIN, {.sival_int = static_cast<char>(Signum::sigDeferredSweep)});
+      while (thread_struct.status_idx.load().status() != Signum::sigSweep) {
+        pthread_yield();
+      }
+    }
 
-    inline void post_handshake(Signum sig) {
+    inline void post_handshake(Signum sig, bool doWeakCheck) {
       sigval_t sigval;
       sigval.sival_int = static_cast<char>(sig);
       /* The following fence is required because any process struct's
@@ -288,6 +294,10 @@ namespace mpgc {
       in_memory_thread_struct *h = thread_struct_list.head();
       while (h) {
         if (!h->marked_dead()) {
+          if (doWeakCheck) {
+            Weak_signal expected_weak_signal = Weak_signal::InBarrier;
+            h->weak_signal.compare_exchange_strong(expected_weak_signal, Weak_signal::DoHandshake);
+          }
           //send signal
           pthread_sigqueue(h->pthread, SIGRTMIN, sigval);
         }
@@ -295,12 +305,13 @@ namespace mpgc {
       }
     }
 
-    inline void wait_handshake(Signum sig) {
+    inline void wait_handshake(Signum sig, bool doWeakCheck) {
       in_memory_thread_struct *h = thread_struct_list.head();
       while (h) {
         // We must replace this busy loop with some other means of waiting.
         // This is very CPU wasting mechanism.
-        while (!h->marked_dead() && h->status_idx.load().status() != sig) {
+        while (!h->marked_dead() && (h->status_idx.load().status() != sig ||
+               (doWeakCheck && h->weak_signal == gc_handshake::Weak_signal::DoHandshake))) {
           std::cpu_relax();
           if (request_gc_termination) {
             return;
@@ -310,9 +321,9 @@ namespace mpgc {
       }
     }
 
-    inline void handshake(Signum sig) {
-      post_handshake(sig);
-      wait_handshake(sig);
+    inline void handshake(Signum sig, bool doWeakCheck = false) {
+      post_handshake(sig, doWeakCheck);
+      wait_handshake(sig, doWeakCheck);
     }
 
   }

@@ -25,14 +25,14 @@
  */
 
 /*
- * gc_cuckoo_map.h
+ * cuckoo_map.h
  *
  *  Created on: Jul 28, 2014
  *      Author: evank
  */
 
-#ifndef GC_CUCKOO_MAP_H_
-#define GC_CUCKOO_MAP_H_
+#ifndef CUCKOO_MAP_H_
+#define CUCKOO_MAP_H_
 
 #include <cstdint>
 #include <random>
@@ -42,19 +42,21 @@
 #include <cassert>
 #include <random>
 
-#include "mpgc/gc.h"
+#include "ruts/versioned_ptr.h"
 #include "ruts/bit_field.h"
 #include "ruts/meta.h"
+#include "ruts/runtime_array.h"
 #include "ruts/hashes.h"
 #include "ruts/cas_loop.h"
+#include "ruts/util.h"
 
-namespace mpgc {
+namespace ruts {
 
   template <std::size_t Cap, std::size_t Bits, std::size_t Size, typename Enable = void> struct __bits_needed;
 
   template <typename K, typename V, typename Hash1=ruts::hash1<K>, typename Hash2=ruts::hash2<K>,
-      std::size_t SegBits = 10>
-  class gc_cuckoo_map : public gc_allocated {
+      std::size_t SegBits = 10, typename Allocator = std::allocator<V>>
+  class cuckoo_map {
   public:
     using key_type = K;
     using value_type = V;
@@ -63,30 +65,27 @@ namespace mpgc {
     using hash2_fn_type = Hash2;
     using hash_type = uint64_t;
 
-    /**
-     * We use pointer<T> rather than gc_ptr<T> in an effort to unify
-     * the MPGC and non-MPGC versions.
-     */
+    //    template <typename T>
+    //    using pointer = T*;
     template <typename T>
-    using pointer = gc_ptr<T>;
+    using pointer
+    = std::conditional_t<std::is_const<T>::value,
+                         typename std::allocator_traits<Allocator>
+                         ::template rebind_alloc<std::remove_const_t<T>>
+                         ::const_pointer,
+                         typename std::allocator_traits<Allocator>
+                         ::template rebind_alloc<std::remove_const_t<T>>
+                         ::pointer>;
     template <typename T, std::size_t NFlags=0>
-    using v_pointer = versioned_gc_ptr<T,NFlags>;
+    using v_pointer = versioned<pointer<T>,NFlags>;
     template <typename T, std::size_t NFlags=0>
-    using av_pointer = atomic_versioned_gc_ptr<T,NFlags>;
-    
+    using av_pointer = atomic_versioned<pointer<T>,NFlags>;
 
   private:
-    struct entry_type : gc_allocated {
+    struct entry_type {
       const key_type key;
       std::atomic<value_type> val;
-      entry_type (gc_token &gc, const key_type &k, const value_type &v) : gc_allocated{gc}, key{k}, val{v} {}
-      static const auto &descriptor() {
-        static gc_descriptor d =
-	  GC_DESC(entry_type)
-	  .template WITH_FIELD(&entry_type::key)
-	  .template WITH_FIELD(&entry_type::val);
-        return d;
-      }
+      entry_type (const key_type &k, const value_type &v) : key{k}, val{v} {}
     };
 
     constexpr static std::size_t num_flags = 2;
@@ -102,6 +101,9 @@ namespace mpgc {
      */
     constexpr static typename entry_ptr_type::template flag_id<1> frozen{};
 
+
+    using entry_alloc_type = meta::rebind_alloc_t<Allocator, entry_type>;
+    using atomic_entry_ptr_alloc_type = meta::rebind_alloc_t<Allocator, atomic_entry_ptr_type>;
 
     constexpr static std::size_t n_tables = 2;
     constexpr static std::size_t n_seg_bits = SegBits;
@@ -121,14 +123,6 @@ namespace mpgc {
       switched_hash(side s, const hash1_fn_type h1, const hash2_fn_type h2) : hash1(h1), hash2(h2), use_hash1(s == side::LEFT) {}
       hash_type operator()(const key_type &key) const {
         return use_hash1 ? hash1(key) : hash2(key);
-      }
-      static const auto &descriptor() {
-	static gc_descriptor d =
-	  GC_DESC(switched_hash)
-	  .template WITH_FIELD(&switched_hash::hash1)
-	  .template WITH_FIELD(&switched_hash::hash2)
-	  .template WITH_FIELD(&switched_hash::use_hash1);
-	return d;
       }
     };
 
@@ -197,19 +191,22 @@ namespace mpgc {
 
     class source_grew {};
 
-    class segment : public gc_allocated {
+    class segment {
+      using slot_array_type = ruts::runtime_array<atomic_entry_ptr_type, atomic_entry_ptr_alloc_type>;
+
       const std::size_t _num;
-      const pointer<table> _table;
-      switched_hash _hash = _table->_hash;
+      table &_table;
+      switched_hash _hash = _table._hash;
       const std::size_t _slot_bits;
       const std::size_t _size = (std::size_t{1} << _slot_bits);
       const std::size_t _mask = _size-1;
-      gc_array_ptr<atomic_entry_ptr_type> _slots{_size};
+      atomic_entry_ptr_alloc_type _alloc;
+      slot_array_type _slots{_size, _alloc};
       std::atomic<pointer<segment>> _replacement{nullptr};
       mutable std::atomic<std::size_t> _next_to_migrate{0};
 
       friend class table;
-      friend class gc_cuckoo_map;
+      friend class cuckoo_map;
 
       /*constexpr*/ std::size_t slot_index(hash_type hash) const {
         return hash & _mask;
@@ -217,11 +214,11 @@ namespace mpgc {
 
       slot_ref slot(hash_type hash) {
         std::size_t i = slot_index(hash);
-        return slot_ref(GC_THIS, i, _slots[i]);
+        return slot_ref(this, i, _slots[i]);
       }
       slot_const_ref slot(hash_type hash) const {
         std::size_t i = slot_index(hash);
-        return slot_const_ref(GC_THIS, i, _slots[i]);
+        return slot_const_ref(this, i, _slots[i]);
       }
 
       slot_ref slot(const key_type &key) {
@@ -306,7 +303,7 @@ namespace mpgc {
 	    return true;
 	  }
 	  return (ptr->key == current->key 
-		  && _table->_side == side::RIGHT);
+		  && _table._side == side::RIGHT);
         };
 
         auto change = [=](entry_ptr_type ep) {
@@ -334,16 +331,16 @@ namespace mpgc {
 
         // Check to make sure the old value wasn't deleted since we read it.
         entry_ptr_type sp = source.contents();
-        // The logic for handling sources that change seeruts very complicated.  For
+        // The logic for handling sources that change seems very complicated.  For
         // now, we're going to punt, which may result in more work being done than
         // strictly necessary.
         if (sp[frozen]) {
-          _table->_map->clear_slot(target, ur.resulting_value(), current->key);
+          _table._map.clear_slot(target, ur.resulting_value(), current->key);
           throw source_grew{};
         }
         if (sp.pointer() != current) {
           // It was removed, so we need to clear the slot.
-          _table->_map->clear_slot(target, ur.resulting_value(), current->key);
+          _table._map.clear_slot(target, ur.resulting_value(), current->key);
           return false;
         }
         // Now we remove the "moving" flag.
@@ -366,15 +363,16 @@ namespace mpgc {
         }
         // We're done moving.  The value is now in both places.
         // Remove it from the source.  If it's not there, it means it was removed.  That's okay.
-        _table->_map->clear_slot(source, current, current->key);
+        _table._map.clear_slot(source, current, current->key);
         return true;
       }
 
 
       void grow(std::size_t by) {
-        pointer<segment> new_seg = make_gc<segment>(GC_THIS, by);
+        pointer<segment> new_seg = _table.create_segment(this, by);
         if (!ruts::try_change_value(_replacement, nullptr, new_seg)) {
           // Somebody else got there first.  That's okay.
+          _table.delete_segment(new_seg);
         }
         help_with_grow();
         // At the end it will be installed.
@@ -418,8 +416,7 @@ namespace mpgc {
         }
         // Now everything has been moved.  We might be the first to have finished (or the
         // one who was might have died before installing), so we'll try to install.
-        ruts::cas_loop_return_value<pointer<segment>>
-          install_res = ruts::try_change_value(_table->_segments[_num], this_as_gc_ptr(nc_this), r);
+        cas_loop_return_value<pointer<segment>> install_res = try_change_value(_table._segments[_num], nc_this, r);
         // If that failed, somebody else got there first... and we might even have grown
         // again.  But that's okay.  We've completed this grow.
         // Even if it succeeded, we can't delete the old one yet, because others are using it.
@@ -430,37 +427,24 @@ namespace mpgc {
       }
 
     public:
-      segment(gc_token &gc, std::size_t n, std::size_t slot_bits, const pointer<table> &t)
-      : gc_allocated{gc},
-        _num(n),
+      explicit segment(std::size_t n, std::size_t slot_bits, atomic_entry_ptr_alloc_type alloc, table &t)
+      : _num(n),
         _table(t),
-        _slot_bits(slot_bits)      {
+        _slot_bits(slot_bits),
+        _alloc(alloc)
+      {
       }
 
-      explicit segment(gc_token &gc, const pointer<segment> &prior, std::size_t plus_bits)
-      : segment(gc,
-                prior->_num,
+      explicit segment(const pointer<segment> &prior, std::size_t plus_bits)
+      : segment(prior->_num,
                 prior->_slot_bits+plus_bits,
+                prior->_alloc,
                 prior->_table)
       {
 //        std::cerr << "--- Growing segment " << prior << " (" << prior->_slot_bits << ") "
 //            << "into " << this << " (" << _slot_bits << ")." << std::endl;
       }
 
-      static const auto &descriptor() {
-        static gc_descriptor d =
-	  GC_DESC(segment)
-	  .template WITH_FIELD(&segment::_num)
-	  .template WITH_FIELD(&segment::_table)
-	  .template WITH_FIELD(&segment::_hash)
-	  .template WITH_FIELD(&segment::_slot_bits)
-	  .template WITH_FIELD(&segment::_size)
-	  .template WITH_FIELD(&segment::_mask)
-	  .template WITH_FIELD(&segment::_slots)
-	  .template WITH_FIELD(&segment::_replacement)
-	  .template WITH_FIELD(&segment::_next_to_migrate);
-        return d;
-      }
 
       pointer<entry_type> find(const key_type &key, hash_type hash) const {
         entry_ptr_type current_entry = slot(hash).contents();
@@ -478,18 +462,18 @@ namespace mpgc {
 
 
       bool remove(const key_type &key, hash_type hash) {
-        slot_ref s = slot(hash);
-	entry_ptr_type ep = s.contents();
-	while (1) {
-	  if (ep[frozen]) {
-	    pointer<segment> new_seg = help_with_grow();
-	    return new_seg->remove(key, hash);
-	  }
-	  pointer<entry_type> e = ep.pointer();
-	  if (e == nullptr || e->key != key) {
-	    return false;
-	  }
-	  auto ur = s->change_using(ep, inc_and_clear_value);
+        atomic_entry_ptr_type &s = *slot(hash);
+        entry_ptr_type ep = s.contents();
+        while (true) {
+          if (ep[frozen]) {
+            pointer<segment> new_seg = help_with_grow();
+            return new_seg->remove(key, hash);
+          }
+          pointer<entry_type> e = ep.pointer();
+          if (e == nullptr || e->key != key) {
+            return false;
+          }
+	  auto ur = s.change_using(ep, inc_and_clear_value);
 	  if (ur) {
 	    return true;
 	  }
@@ -526,7 +510,7 @@ namespace mpgc {
             if (b < resulting_size || g > growth) {
               resulting_size = b;
               growth = g;
-              best = GC_THIS;
+              best = this;
             }
             return;
           }
@@ -537,91 +521,101 @@ namespace mpgc {
 
     };
 
-    class table : public gc_allocated {
+    using segment_alloc_type = meta::rebind_alloc_t<Allocator, segment>;
+
+
+    class table {
       static const std::size_t n_segments = 1 << n_seg_bits;
 
-      const pointer<gc_cuckoo_map> _map;
+      cuckoo_map &_map;
       const side _side;
       const switched_hash _hash;
-      using atomic_seg_ptr = std::atomic<pointer<segment>>;
-      const gc_array_ptr<atomic_seg_ptr> _segments = make_gc_array<atomic_seg_ptr>(n_segments);
+      std::array<std::atomic<pointer<segment>>, n_segments> _segments;
+      table &_other_side = _map.other_table(_side);
+      mutable segment_alloc_type _seg_alloc;
 
-      pointer<const segment> find_segment(hash_type hash) const {
+      const segment &find_segment(hash_type hash) const {
         std::size_t seg_num = left_bit_field(hash, n_seg_bits);
         pointer<const segment> sp = _segments[seg_num].load();
-        return sp;
+        return *sp;
       }
-      pointer<segment> find_segment(hash_type hash) {
+      segment &find_segment(hash_type hash) {
         std::size_t seg_num = left_bit_field(hash, n_seg_bits);
-        return _segments[seg_num];
+        return *(_segments[seg_num].load());
       }
 
       friend class segment;
-      friend class gc_cuckoo_map;
+      friend class cuckoo_map;
     public:
+      template <typename ...Args>
+      pointer<segment>
+      create_segment(Args&&...args) const{
+        pointer<segment> s = _seg_alloc.allocate(1);
+        _seg_alloc.construct(s, std::forward<Args>(args)...);
+        return s;
+      }
 
-      explicit table(gc_token &gc, const pointer<gc_cuckoo_map> &m, side s, const hash1_fn_type &hash1, const hash2_fn_type hash2, std::size_t seg_slot_bits) :
-      gc_allocated{gc}, _map(m), _side(s), _hash(s, hash1, hash2)
+      void
+      delete_segment(const pointer<segment> &s) const {
+        _seg_alloc.destroy(s);
+        _seg_alloc.deallocate(s, 1);
+      }
+
+      explicit table(cuckoo_map &m, side s, const hash1_fn_type &hash1, const hash2_fn_type hash2, std::size_t seg_slot_bits, Allocator a) :
+      _map(m), _side(s), _hash(s, hash1, hash2), _seg_alloc(segment_alloc_type{a})
       {
         int n = 0;
         for (auto &p : _segments) {
-          p = make_gc<segment>(n++, seg_slot_bits, GC_THIS);
+          p = create_segment(n++, seg_slot_bits, atomic_entry_ptr_alloc_type{a}, *this);
         }
+
       }
 
-      static const auto &descriptor() {
-        static gc_descriptor d =
-	  GC_DESC(table)
-	  .template WITH_FIELD(&table::_map)
-	  .template WITH_FIELD(&table::_side)
-	  .template WITH_FIELD(&table::_hash)
-	  .template WITH_FIELD(&table::_segments);
-        return d;
-      }
-
-      pointer<table> other_side() const {
-        return _map->other_table(_side);
+      table &other_side() const {
+        return _other_side;
       }
 
       slot_ref slot(const key_type &key) {
         hash_type hash = _hash(key);
-        pointer<segment> seg = find_segment(hash);
-        return seg->slot(hash);
+        segment &seg = find_segment(hash);
+        return seg.slot(hash);
       }
 
       pointer<entry_type> find(const key_type &key) const {
         hash_type hash = _hash(key);
-        pointer<const segment> seg = find_segment(hash);
-        return seg->find(key, hash);
+        const segment &seg = find_segment(hash);
+        return seg.find(key, hash);
       }
 
       bool remove(const key_type &key) {
         hash_type hash = _hash(key);
-        pointer<segment> seg = find_segment(hash);
-        return seg->remove(key, hash);
+        segment &seg = find_segment(hash);
+        return seg.remove(key, hash);
       }
       bool replace_null(const pointer<entry_type> &with) {
         hash_type hash = _hash(with->key);
-        pointer<segment> seg = find_segment(hash);
-        return seg->replace_null(with, hash);
+        segment &seg = find_segment(hash);
+        return seg.replace_null(with, hash);
       }
+
     };
 
-    pointer<table> _left_table;
-    pointer<table> _right_table;
+    table _left_table;
+    table _right_table;
+    mutable entry_alloc_type _entry_alloc;
 
-    pointer<table> table_on(side s) {
+    table &table_on(side s) {
       return s == side::LEFT ? _left_table : _right_table;
     }
 
-    pointer<table> other_table(side s) {
+    table &other_table(side s) {
       return s == side::RIGHT ? _left_table : _right_table;
     }
 
     pointer<entry_type> find(const key_type &key) const {
-      pointer<entry_type> e = _left_table->find(key);
+      pointer<entry_type> e = _left_table.find(key);
       if (e == nullptr) {
-        e = _right_table->find(key);
+        e = _right_table.find(key);
       }
       return e;
     }
@@ -659,11 +653,11 @@ namespace mpgc {
           throw source_grew{};
         }
 
-        slot_ref left_target = _right_table->slot(left_current->key);
+        slot_ref left_target = _right_table.slot(left_current->key);
         if (left_target.seg->accept_move(left_source, left_current, left_target)) {
           return side::LEFT;
         }
-        slot_ref right_target = _left_table->slot(right_current->key);
+        slot_ref right_target = _left_table.slot(right_current->key);
         if (right_target.seg->accept_move(right_source, right_current, right_target)) {
           return side::RIGHT;
         }
@@ -718,7 +712,7 @@ namespace mpgc {
         }
         slot.seg->growth_candidate(key, e->key, best, resulting_size, growth);
         key = e->key;
-        t = t->other_side();
+        t = &t->other_side();
       }
 
     }
@@ -729,9 +723,9 @@ namespace mpgc {
       pointer<segment> best = nullptr;
       std::size_t resulting_size = 65;
       std::size_t growth = 0;
-      best_to_grow(_left_table, key, best, resulting_size, growth);
+      best_to_grow(&_left_table, key, best, resulting_size, growth);
       if (best != nullptr) {
-        best_to_grow(_right_table, key, best, resulting_size, growth);
+        best_to_grow(&_right_table, key, best, resulting_size, growth);
       }
       return std::make_pair(best, growth);
     }
@@ -744,7 +738,7 @@ namespace mpgc {
   }
 
     bool clear_slot(const slot_ref &slot, entry_ptr_type expected, const key_type &key){
-      auto ur = slot->change_using(expected, inc_and_clear_value);
+      auto ur = slot->inc_and_change(expected, nullptr);
       if (ur) {
         return true;
       } else {
@@ -764,15 +758,15 @@ namespace mpgc {
 
     void evict_blocker(const key_type &key) {
       while (true) {
-        slot_ref left_slot = _left_table->slot(key);
-        slot_ref right_slot = _right_table->slot(key);
+        slot_ref left_slot = _left_table.slot(key);
+        slot_ref right_slot = _right_table.slot(key);
         try {
           evict_one(left_slot, right_slot, 0, max_eviction_depth);
           return;
         } catch (source_grew &) {
           continue;
         } catch (grow_needed &) {
-          std::pair<pointer<segment> , std::size_t> to_grow = best_to_grow(key);
+          std::pair<pointer<segment>, std::size_t> to_grow = best_to_grow(key);
           if (to_grow.first == nullptr) {
             // If it's null, that means we found a null along the way...Or nothing can be grown,
             // which we assume can't happen.
@@ -808,18 +802,19 @@ namespace mpgc {
       }
     }
 
+
     template <typename GFn, typename UFn>
     void evict_and_put(const pointer<entry_type> &e, replace_return &rr, GFn &&gfn, UFn &&ufn) {
       // This should eventually succeed.  (Most of the time, the first or second time around)
       while (true) {
-        if (_left_table->replace_null(e)) {
+        if (_left_table.replace_null(e)) {
           rr = replace_return(true, false, value_type(), e->val);
           return;
         }
         // It's possible that somebody else put an entry for the same key
         // in the left table since the last time we looked.  This is okay.  It's as
         // if we wrote first and they overwrote.
-        if (_right_table->replace_null(e)) {
+        if (_right_table.replace_null(e)) {
           rr = replace_return(true, false, value_type(), e->val);
           return;
         }
@@ -830,6 +825,13 @@ namespace mpgc {
       }
 
     }
+
+    pointer<entry_type> new_entry(const key_type &key, const value_type &val) const {
+      pointer<entry_type> e = _entry_alloc.allocate(1);
+      _entry_alloc.construct(e, key, val);
+      return e;
+    }
+
 
     static std::size_t slot_bits_for(std::size_t cap) {
       std::size_t bits = 1;
@@ -842,23 +844,22 @@ namespace mpgc {
     }
 
   public:
-    gc_cuckoo_map(gc_token &gc, const hash1_fn_type &h1, const hash2_fn_type &h2, std::size_t capacity = default_cap) :
-      gc_allocated{gc},
-      _left_table{make_gc<table>(GC_THIS, side::LEFT, h1, h2, slot_bits_for(capacity))},
-      _right_table{make_gc<table>(GC_THIS, side::RIGHT, h1, h2, slot_bits_for(capacity))}
+    cuckoo_map(const hash1_fn_type &h1, const hash2_fn_type &h2, std::size_t capacity = default_cap, Allocator alloc = Allocator{}) :
+      _left_table(*this, side::LEFT, h1, h2, slot_bits_for(capacity), alloc),
+      _right_table(*this, side::RIGHT, h1, h2, slot_bits_for(capacity), alloc),
+      _entry_alloc(alloc)
       {}
 
-    explicit gc_cuckoo_map(gc_token &gc, std::size_t capacity = default_cap) :
-        gc_cuckoo_map(gc, hash1_fn_type{}, hash2_fn_type{}, capacity)
+      cuckoo_map(const hash1_fn_type &h1, const hash2_fn_type &h2, Allocator alloc) :
+        cuckoo_map(h1, h2, default_cap, alloc)
+      {}
+    explicit cuckoo_map(std::size_t default_cap, Allocator alloc = Allocator{}) :
+        cuckoo_map{hash1_fn_type{}, hash2_fn_type{}, default_cap, alloc}
     {}
 
-    static const auto &descriptor() {
-      static gc_descriptor d =
-	GC_DESC(gc_cuckoo_map)
-	.template WITH_FIELD(&gc_cuckoo_map::_left_table)
-	.template WITH_FIELD(&gc_cuckoo_map::_right_table);
-      return d;
-    }
+    explicit cuckoo_map(Allocator alloc = Allocator{}) :
+                cuckoo_map{hash1_fn_type{}, hash2_fn_type{}, default_cap, alloc}
+    {}
 
     bool contains(const key_type &key) const {
       return find(key) != nullptr;
@@ -874,8 +875,8 @@ namespace mpgc {
       // temporarily hold values (left shadowing right) with different
       // entries.  Removing the shadowing one first would make the other
       // value reappear.
-      bool res2 = _right_table->remove(key);
-      bool res1 = _left_table->remove(key);
+      bool res2 = _right_table.remove(key);
+      bool res1 = _left_table.remove(key);
       return res1 || res2;
     }
 
@@ -992,7 +993,7 @@ namespace mpgc {
       if (!put_in_existing(key, rr, std::forward<GFn>(guard), std::forward<UFn>(updater))
           && std::forward<GFn>(guard)(false, value_type{}))
         {
-          pointer<entry_type> e = make_gc<entry_type>(key, std::forward<UFn>(updater)(false, value_type{}));
+          pointer<entry_type> e = new_entry(key, std::forward<UFn>(updater)(false, value_type{}));
           evict_and_put(e, rr, std::forward<GFn>(guard), std::forward<UFn>(updater));
         }
       return rr;
@@ -1020,17 +1021,17 @@ namespace mpgc {
       pointer<entry_type> e = find(key);
       if (e == nullptr) {
         // if it's not there, we can't replace
-        return replace_return(false, false, value_type{}, value_type{});
+        return replace_return(false, false, value_type {});
       }
       auto clrv = ruts::try_change_value(e->val, expected, val);
-      return replace_return(clrv, true, clrv.prior_value, clrv.resulting_value());
+      return replace_return(clrv, true, clrv.prior_value);
     }
 
     class reference {
-      pointer<gc_cuckoo_map> _map;
+      pointer<cuckoo_map> _map;
       const key_type _key;
     public:
-      reference(const pointer<gc_cuckoo_map> &m, const key_type key) : _map(m), _key(key) {}
+      reference(const pointer<cuckoo_map> &m, const key_type key) : _map(m), _key(key) {}
       bool exists() const {
         return _map->contains(_key);
       }
@@ -1157,7 +1158,7 @@ namespace mpgc {
     }
 
     reference operator[](const key_type &key) {
-      return reference(GC_THIS, key);
+      return reference(this, key);
     }
 
     value_type operator[](const key_type &key) const {
@@ -1165,7 +1166,7 @@ namespace mpgc {
     }
 
     reference at(const key_type &key) {
-      return reference(GC_THIS, key);
+      return reference(this, key);
     }
 
     value_type at(const key_type &key) const {
@@ -1174,21 +1175,46 @@ namespace mpgc {
 
   };
 
-  template <typename K, typename V, typename Hash1=ruts::hash1<K>, typename Hash2=ruts::hash2<K> >
-  using small_gc_cuckoo_map = gc_cuckoo_map<K,V,Hash1,Hash2,0>;
+
+  template <typename K, typename V, typename Hash1=ruts::hash1<K>, typename Hash2=ruts::hash2<K>,
+      typename Allocator = std::allocator<V>>
+      class small_cuckoo_map : public cuckoo_map<K,V,Hash1,Hash2,0,Allocator>
+  {
+    using base = cuckoo_map<K,V,Hash1,Hash2,0,Allocator>;
+    using typename base::hash1_fn_type;
+    using typename base::hash2_fn_type;
+  public:
+    constexpr static std::size_t default_cap = 16;
+    small_cuckoo_map(const hash1_fn_type &h1, const hash2_fn_type &h2, std::size_t capacity = default_cap, Allocator alloc = Allocator{}) :
+      base(h1, h2, default_cap, alloc)
+  {}
+
+    small_cuckoo_map(const hash1_fn_type &h1, const hash2_fn_type &h2, Allocator alloc) :
+        small_cuckoo_map(h1, h2, default_cap, alloc)
+      {}
+    explicit small_cuckoo_map(std::size_t default_cap, Allocator alloc = Allocator{}) :
+        small_cuckoo_map{hash1_fn_type{}, hash2_fn_type{}, default_cap, alloc}
+    {}
+
+    explicit small_cuckoo_map(Allocator alloc = Allocator{})
+    : small_cuckoo_map{hash1_fn_type{}, hash2_fn_type{}, default_cap, alloc}
+    {}
 
 
-  template <typename K, typename V, typename Hash1, typename Hash2, std::size_t SegBits>
-  constexpr typename gc_cuckoo_map<K,V,Hash1,Hash2,SegBits>::entry_ptr_type::template flag_id<0>
-  gc_cuckoo_map<K,V,Hash1,Hash2,SegBits>::moving;
+  };
 
-  template <typename K, typename V, typename Hash1, typename Hash2, std::size_t SegBits>
-  constexpr typename gc_cuckoo_map<K,V,Hash1,Hash2,SegBits>::entry_ptr_type::template flag_id<1>
-  gc_cuckoo_map<K,V,Hash1,Hash2,SegBits>::frozen;
+
+  template <typename K, typename V, typename Hash1, typename Hash2, std::size_t SegBits, typename Allocator>
+  constexpr typename cuckoo_map<K,V,Hash1,Hash2,SegBits,Allocator>::entry_ptr_type::template flag_id<0>
+  cuckoo_map<K,V,Hash1,Hash2,SegBits,Allocator>::moving;
+
+  template <typename K, typename V, typename Hash1, typename Hash2, std::size_t SegBits, typename Allocator>
+  constexpr typename cuckoo_map<K,V,Hash1,Hash2,SegBits,Allocator>::entry_ptr_type::template flag_id<1>
+  cuckoo_map<K,V,Hash1,Hash2,SegBits,Allocator>::frozen;
 
 
 }
 
 
 
-#endif /* GC_CUCKOO_MAP_H_ */
+#endif /* CUCKOO_MAP_H_ */

@@ -38,6 +38,7 @@
 #include <limits>
 #include <string>
 #include <sstream>
+#include <cmath>
 #include "ruts/meta.h"
 
 namespace ruts {
@@ -221,9 +222,185 @@ namespace ruts {
     return false;
   }
 
+  template <typename T>
+  class vrange {
+    const T base;
+    const T by;
+    const std::size_t n_vals;
+
+    static
+    std::size_t compute_vals(T min, T max, T inc)
+    {
+      std::size_t n = (max-min)/inc;
+      return n;
+    }
+  public:
+    vrange(T min, T max, T inc = T{1})
+      : base{min}, by{inc},
+        n_vals{compute_vals(min, max, inc)}
+    {}
+
+    explicit vrange(const T &bound) : vrange{T{0}, bound} {}
+
+    class iterator {
+    public:
+      using difference_type = std::ptrdiff_t;
+      using value_type = T;
+      using pointer = iterator;
+      using reference = T;
+      using iterator_category = std::random_access_iterator_tag;
+
+      value_type base;
+      value_type by;
+      std::size_t n;
+      friend class vrange;
+
+      explicit iterator(std::size_t i, T min, T inc)
+        : base{min}, by{inc}, n{i}
+      {}
+
+      constexpr T val() const {
+        return base+by*n;
+      }
+
+    public:
+      iterator() = default;
+
+      bool operator ==(const iterator &rhs) const {
+        return val() = rhs.val();
+      }
+      bool operator !=(const iterator &rhs) const {
+        return val() != rhs.val();
+      }
+      bool operator <(const iterator &rhs) const {
+        return val() < rhs.val();
+      }
+      bool operator <=(const iterator &rhs) const {
+        return val() <- rhs.val();
+      }
+      bool operator >(const iterator &rhs) const {
+        return val() > rhs.val();
+      }
+      bool operator >=(const iterator &rhs) const {
+        return val() >= rhs.val();
+      }
+
+      value_type operator *() const {
+        return val();
+      }
+
+      iterator &operator +=(difference_type d) {
+        n += d;
+        return *this;
+      }
+
+      iterator &operator -=(difference_type d) {
+        n -= d;
+        return *this;
+      }
+
+      iterator operator +(difference_type d) const {
+        iterator temp = *this;
+        temp += d;
+        return temp;
+      }
+      
+      iterator operator -(difference_type d) const {
+        iterator temp = *this;
+        temp -= d;
+        return temp;
+      }
+
+      iterator &operator ++() {
+        n++;
+        return *this;
+      }
+
+      iterator &operator --() {
+        n--;
+        return *this;
+      }
+
+      iterator operator ++(int) {
+        iterator temp = *this;
+        n++;
+        return temp;
+      }
+
+      iterator operator --(int) {
+        iterator temp = *this;
+        n--;
+        return temp;
+      }
+
+      difference_type operator -(const iterator &rhs) const {
+        assert(base==rhs.base && by==rhs.by);
+        return n-rhs.n;
+      }
+
+      value_type operator[](difference_type i) const {
+        return base+by*(n+i);
+      }
+    }; // iterator
+
+    iterator begin() const {
+      return iterator{0, base, by};
+    }
+    iterator end() const {
+      return iterator{n_vals, base, by};
+    }
+
+    
+  }; // vrange
+
+  template <typename T>
+  inline
+  vrange<T> consecutive(T from, T to, T by = T{1}) {
+    return vrange<T>(from, to, by);
+  }
+
+  template <typename T>
+  inline
+  vrange<T> consecutive_to(T to, T by = T{1}) {
+    return vrange<T>(T{0}, to, by);
+  }
+
+  template <typename C>
+  inline
+  auto indexes(C&& coll) {
+    return consecutive_to(std::forward<C>(coll).size());
+  }
+
+  
+
 }
 
 
 
 
 #endif /* UTIL_H_ */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
