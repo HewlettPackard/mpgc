@@ -873,7 +873,7 @@ namespace mpgc {
                                     return traits_type::eq(c,target);
                                   };
                                   auto last = s+count;
-                                  return !std::find_if(s,last,pred)!=last;
+                                  return std::find_if(s,last,pred)=last;
                                 });
     }
 
@@ -973,7 +973,7 @@ namespace mpgc {
                                      return traits_type::eq(c,target);
                                    };
                                    auto last = s+count;
-                                   return !std::find_if(s,last,pred)!=last;
+                                   return std::find_if(s,last,pred)=last;
                                  });
     }
 

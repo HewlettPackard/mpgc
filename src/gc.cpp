@@ -89,7 +89,7 @@ namespace mpgc {
   uint8_t* base_offset_ptr::_heap_end = nullptr;
   std::size_t base_offset_ptr::_heap_size = 0;
 
-  static gc_control_block *cblock = nullptr;
+  gc_control_block *cblock = nullptr;
 
   void initialize() {
     static std::once_flag done;

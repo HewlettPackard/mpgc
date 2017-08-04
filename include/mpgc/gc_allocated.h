@@ -37,6 +37,7 @@ namespace mpgc {
   namespace gc_handshake {
     struct in_memory_thread_struct;
   }
+  extern void install_descriptor_epilogue(gc_descriptor&);
 
   namespace gc_allocator {
     class bump_allocation_slots;
@@ -56,6 +57,12 @@ namespace mpgc {
     gc_descriptor _descriptor;
 
     friend void allocation_epilogue(gc_handshake::in_memory_thread_struct&, void*, gc_token&, std::size_t);
+    //An indicator class to restrict only allocation_epilogue to be able to call the following ctor.
+    class only_allocation_epilogue{};
+    //Only to be called from allocation epilogue.
+    explicit gc_allocated(only_allocation_epilogue, gc_token &gc)
+      : _descriptor(gc_descriptor::install{}, gc.descriptor)
+    {}
     protected:
     /*
      * By requiring a gc_token parameter, we ensure that
@@ -74,6 +81,7 @@ namespace mpgc {
       : _descriptor(gc_descriptor::install{}, gc.descriptor)
     {
       //assert(_descriptor.is_valid());
+      install_descriptor_epilogue(_descriptor);
     }
   public:
     /*
@@ -85,7 +93,10 @@ namespace mpgc {
     gc_allocated &operator =(const gc_allocated &) = delete;
     gc_allocated &operator =(gc_allocated &) = delete;
 
-    const gc_descriptor &get_gc_descriptor() const {
+    const gc_descriptor& get_gc_descriptor() const {
+      return _descriptor;
+    }
+    gc_descriptor& get_non_const_gc_desc() {
       return _descriptor;
     }
   protected:

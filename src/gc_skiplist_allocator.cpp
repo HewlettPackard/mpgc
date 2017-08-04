@@ -73,7 +73,7 @@ namespace mpgc {
       offset_ptr<global_chunk> skiplist::bump_pointer_allocate(gc_control_block &cb,
                                                      slot_number &myslot,
                                                      const std::size_t size) {
-        bump_chunk exp = tail.bump_ptr, exp1;
+        bump_chunk exp{bump_chunk::from_volatile, tail.bump_ptr}, exp1;
         slot_number curr_slot(slot_fld.decode(exp.begin), slot_fld.decode(exp.end)),
                                            curr_slot1(0, 0);
         slot &myslot_ref = cb.bump_alloc_slots.get_ref(myslot);
@@ -85,7 +85,7 @@ namespace mpgc {
             std::size_t exp_level_key = tail.level_orig_end;
             std::atomic_signal_fence(std::memory_order_acquire);
             exp1 = exp;
-            exp = tail.bump_ptr;
+            exp = bump_chunk{bump_chunk::from_volatile, tail.bump_ptr};
             if (exp.begin == exp1.begin) {
               help_inserting_bump_chunk(exp_level_key, exp);
             } 
@@ -128,7 +128,7 @@ namespace mpgc {
       }
 
       void skiplist::help_unfinished_bump_alloc() {
-        bump_chunk exp = tail.bump_ptr, exp1;
+        bump_chunk exp{bump_chunk::from_volatile, tail.bump_ptr}, exp1;
         slot_number sn(slot_fld.decode(exp.begin),
                                               slot_fld.decode(exp.end)), sn1;
         _help_unfinished_bump_alloc(control_block(), exp, exp1, sn, sn1, true);

@@ -41,7 +41,10 @@
 
 namespace mpgc {
   namespace gc_handshake {
-    template <typename Fn, typename ...Args> void process_stack(const std::size_t*, const std::size_t*, Fn&&, Args&& ...);
+    struct in_memory_thread_struct;
+    template <typename Fn, typename ...Args>
+    void process_stack(const std::size_t*, const std::size_t*, Fn&&, Args&& ...);
+    void process_stack_weak_ptrs(in_memory_thread_struct&, std::size_t*, std::size_t * const);
   }
 
   namespace gc_allocator {
@@ -252,7 +255,9 @@ namespace mpgc {
     friend class std::versioned_pointer_traits<offset_ptr<T>>;  
     friend class gc_descriptor;
     template <typename Fn, typename ...Args> friend void gc_handshake::process_stack(const std::size_t*, const std::size_t*, Fn&&, Args&& ...);
+    friend void gc_handshake::process_stack_weak_ptrs(gc_handshake::in_memory_thread_struct&, std::size_t*, std::size_t * const);
     friend class weak_gc_ptr<T>;
+    friend class mark_bitmap;
 
     constexpr explicit offset_ptr(std::size_t o) : base_offset_ptr(o) {}
     

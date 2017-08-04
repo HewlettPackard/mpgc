@@ -141,26 +141,36 @@ namespace mpgc {
     constexpr static inline std::size_t align_size_up(std::size_t size, std::size_t alignment) {
       return (size + (alignment - 1)) & ~(alignment - 1);
     }
-    //Please read comment above about max_level to know why we don't force alignment.
+
+   /*
+    * We need to be able to copy and assign a bump_chunk from a
+    * volatile bump chunk.  This requires a constructor and assignment
+    * operator that takes a volatile (or const volatile) ref, which
+    * can't be defaulted and so needs a body.  GCC 5.4.0 insists that
+    * this means that bump_chunk isn't trivially copyable (I believe
+    * it's wrong) and we get a static assertion failure when we try to
+    * make an atomic<bump_chunk> inside of atomic16B<bump_chunk>.
+    * (This all worked in 4.9.2/3.)
+    *
+    * The fix I'm going with is to get rid of the assignment operator
+    * and add a two-argument constructor that takes a volatile ref and
+    * an indicator object.  This seems to make GCC 5.4.0 happy.
+    */
     struct bump_chunk{
       uint64_t begin = 0;
       uint64_t end = 0;
-      bump_chunk(volatile bump_chunk& c) : begin(c.begin), end(c.end) {}
-      bump_chunk(const bump_chunk &) = default;
-      bump_chunk(bump_chunk &c) : begin(c.begin), end(c.end) {}
       bump_chunk() = default;
+      bump_chunk(uint64_t b, uint64_t e) : begin{b}, end{e} {}
+      bump_chunk(const bump_chunk &) = default;
       bump_chunk& operator=(const bump_chunk &c) = default;
-      bump_chunk& operator=(bump_chunk &c) {
-        begin = c.begin;
-        end = c.end;
-        return *this;
-      }
-      bump_chunk& operator=(volatile bump_chunk &c) {
-        begin = c.begin;
-        end = c.end;
-        return *this;
-      }
+      struct from_volatile_t {};
+      constexpr static from_volatile_t from_volatile{};
+
+      bump_chunk(from_volatile_t, volatile bump_chunk &c)
+        : begin{c.begin}, end{c.end}
+      {}
     };
+   
     struct skip_node {
       static std::atomic<std::size_t> n_skip_nodes;
       union {
@@ -271,7 +281,7 @@ namespace mpgc {
           std::size_t beg_word = exp.begin;
           std::size_t end_word = beg_word - 1 + *reinterpret_cast<std::size_t*>(base_offset_ptr::base() +
                                                                                 (beg_word << alignment_log));
-          bump_chunk des = tail.bump_ptr;
+          bump_chunk des(bump_chunk::from_volatile, tail.bump_ptr);
           if (des.begin == exp.begin && des.end == 0) {
             tail.level_orig_end.compare_exchange_strong(expected_level_key,
                                                         key_fld.replace(expected_level_key, end_word));
@@ -313,7 +323,7 @@ namespace mpgc {
       bool replace_bump_chunk(gc_control_block &cb, offset_ptr<global_chunk> chunk) {
         //first pull out the chunk and put it in chunk_expansion_slots
         //first read the bump ptr
-        bump_chunk exp = tail.bump_ptr;
+        bump_chunk exp{bump_chunk::from_volatile, tail.bump_ptr};
         //then read the key
         std::size_t end_word = key_fld.decode(tail.level_orig_end);
         std::atomic<std::size_t> *atomic_size_ptr = reinterpret_cast<std::atomic<std::size_t>*>(base_offset_ptr::base() +
@@ -321,7 +331,7 @@ namespace mpgc {
         std::size_t prev_size = atomic_size_ptr->load();
 
         //then again read the bump ptr. If it is still the same, then perform store.
-        bump_chunk exp1 = tail.bump_ptr;
+        bump_chunk exp1{bump_chunk::from_volatile, tail.bump_ptr};
         std::size_t size = end_word - exp.begin + 1;
         slot_number slot1(slot_fld.decode(exp.begin),
                           slot_fld.decode(exp.end));
@@ -375,14 +385,14 @@ namespace mpgc {
                                                const std::size_t size,
                                                offset_ptr<global_chunk> c) {
         std::size_t alloc_sz = (level * sizeof(offset_ptr<skip_node>) + sizeof(skip_node)) >> alignment_log;
-        bump_chunk exp = tail.bump_ptr;
+        bump_chunk exp{bump_chunk::from_volatile, tail.bump_ptr};
         std::atomic_signal_fence(std::memory_order_release);
         bump_chunk des;
         do {
           //Deal with the case where exp.end is 0 and exp.begin is not. Means someone is inserting a new chunk.
           if (exp.begin != 0 && exp.end == 0) {
             std::size_t exp_level_key = tail.level_orig_end;
-            bump_chunk exp1 = tail.bump_ptr;
+            bump_chunk exp1{bump_chunk::from_volatile, tail.bump_ptr};
             if (exp.begin == exp1.begin) {
               //exp is passed by reference, so will be updated.
               help_inserting_bump_chunk(exp_level_key, exp);
@@ -419,7 +429,7 @@ namespace mpgc {
               //This means that chunk c has been added as bump chunk and hence there is no need to allocate skip node.
               return nullptr;
             }
-            exp = tail.bump_ptr;
+            exp = bump_chunk{bump_chunk::from_volatile, tail.bump_ptr};
           }
         } while(true);
       }
@@ -478,14 +488,14 @@ namespace mpgc {
         bump_chunk des;
         des.begin = beg_word;
         //Need to read bump_ptr to ensure the key read is legit.
-        exp = tail.bump_ptr;
+        exp = bump_chunk{bump_chunk::from_volatile, tail.bump_ptr};
         if (exp.end != 0) {
           //Somebody has successfully installed a new chunk.
           return false;
         }
         //read current key;
         std::size_t expected_level_key = tail.level_orig_end;
-        bump_chunk exp1 = tail.bump_ptr;
+        bump_chunk exp1{bump_chunk::from_volatile, tail.bump_ptr};
         if (exp.begin != 0 && exp1.begin != exp.begin) {
           return false;
         }

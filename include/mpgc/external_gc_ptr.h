@@ -47,6 +47,7 @@
 
 namespace mpgc {
   extern void initialize();
+  extern volatile uint8_t request_gc_termination;
   
     namespace inbound_pointers {
       using target_base = const gc_allocated;
@@ -1054,7 +1055,7 @@ namespace mpgc {
     {}
 
     ~external_weak_gc_ptr() noexcept {
-      if (_slot != nullptr) {
+      if (!request_gc_termination && _slot != nullptr) {
         iwt::release_slot(_slot);
         _slot = nullptr;
       }

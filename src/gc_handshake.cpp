@@ -63,19 +63,32 @@ namespace mpgc {
     }
 
     template <typename Fn, typename ...Args>
-    static void process_stack(const std::size_t *start, const std::size_t *end, Fn&& func, Args&& ...args) {
+    void process_stack(const std::size_t *start,
+                       const std::size_t *end,
+                       Fn&& func,
+                       Args&& ...args) {
+      constexpr auto ptr_type_fld = bits::field<special_ptr_type, std::size_t>(0, 2);
       while (start < end) {
         if (base_offset_ptr::is_valid(reinterpret_cast<uint8_t*>(*start))) {
-          std::forward<Fn>(func)(offset_ptr<const gc_allocated>(reinterpret_cast<const gc_allocated*>(*start)), std::forward<Args>(args)...);
+          std::forward<Fn>(func)(offset_ptr<const gc_allocated>(
+            reinterpret_cast<const gc_allocated*>(*start)), std::forward<Args>(args)...);
         } else if (base_offset_ptr::could_be_offset_ptr(*start)) {
-          std::forward<Fn>(func)(offset_ptr<const gc_allocated>(*start), std::forward<Args>(args)...);
+          offset_ptr<gc_allocated> ptr(ptr_type_fld.replace(*start,
+                                                            special_ptr_type::Strong));
+          if (ptr.is_valid() && ptr->get_gc_descriptor().is_valid()) {
+            weak_gc_ptr<gc_allocated>::clear_sweep_allocated(ptr);
+            //func is supposed to filter out weak pointers. That's why we can't reuse ptr.
+            std::forward<Fn>(func)(offset_ptr<const gc_allocated>(*start),
+                                   std::forward<Args>(args)...);
+          }
         }
         start++;
       }
     }
 
-    static void process_stack_weak_ptrs(in_memory_thread_struct &thread_struct,
-                                        std::size_t *start, std::size_t * const end) {
+    void process_stack_weak_ptrs(in_memory_thread_struct &thread_struct,
+                                 std::size_t *start, std::size_t * const end) {
+      gc_control_block &cb = control_block();
       bool clear_signal = false;
       /* We need to make signal clearing conditional as this function may be called while
        * thread is inside lock/write_barrier.
@@ -84,9 +97,23 @@ namespace mpgc {
         thread_struct.weak_signal = Weak_signal::InBarrier;
         clear_signal = true;
       }
+
+      for (auto it = thread_struct.on_stack_wp_set.begin();
+           it != thread_struct.on_stack_wp_set.end();) {
+        if (*it <= start) {
+          it = thread_struct.on_stack_wp_set.erase(it);
+        } else {
+          it++;
+        }
+      }
+
       while (start < end) {
-        if (base_offset_ptr::could_be_offset_ptr(*start) && base_offset_ptr::is_weak(*start)) {
-          thread_struct.bitmap->cleanup_weak_ptr(start);
+        if (base_offset_ptr::could_be_offset_ptr(*start) &&
+            base_offset_ptr::is_weak(*start)) {
+          offset_ptr<const gc_allocated> ptr(*start);
+          if (!weak_gc_ptr<const gc_allocated>::marked_or_sweep_allocated(cb, ptr)) {
+            thread_struct.on_stack_wp_set.insert(start);
+          }
         }
         start++;
       }
@@ -214,9 +241,9 @@ namespace mpgc {
         if (sigaction(SIGABRT, &act, NULL) < 0) {
           std::abort();
         }
-    //    if (sigaction(SIGSEGV, &act, NULL) < 0) {
-      //    std::abort();
-        //}
+     //   if (sigaction(SIGSEGV, &act, NULL) < 0) {
+       //   std::abort();
+      //  }
       }
 
       if (thread_struct_list.head()) {

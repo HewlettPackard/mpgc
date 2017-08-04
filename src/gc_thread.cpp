@@ -33,9 +33,10 @@
 
 namespace mpgc {
 
-  volatile bool request_gc_termination = false;
+  volatile uint8_t request_gc_termination = 0;
   static std::mutex gc_termination_mutex;
   static std::condition_variable gc_terminated;
+  extern gc_control_block *cblock;
 
   //Used by fault-tolerance code to determine which barrier will be the next one.
   static const Barrier_indices
@@ -137,7 +138,8 @@ namespace mpgc {
      */
     std::atomic_signal_fence(std::memory_order_release);
 
-    const offset_ptr<const gc_allocated> ptr = new (p) gc_allocated(tok);
+    const offset_ptr<const gc_allocated> ptr =
+        new (p) gc_allocated(gc_allocated::only_allocation_epilogue{}, tok);
 
     /* We need the following signal_fence because if we read the status
      * before the store above, get a async signal, and then make the above
@@ -176,10 +178,30 @@ namespace mpgc {
     }
   }
 
+  void install_descriptor_epilogue(gc_descriptor &desc) {
+    constexpr auto stage_bits_fld = bits::field<Weak_stage, uint16_t>(0, 2);
+    //The following condition is needed to avoid failure during gc_control_block creation.
+    gc_control_block *cb = cblock;
+    if (!cb) {
+      return;
+    }
+    //gc_control_block &cb = control_block();
+    gc_handshake::in_memory_thread_struct &tstruct =
+                           *gc_handshake::thread_struct_handles.handle;
+
+    tstruct.weak_signal = gc_handshake::Weak_signal::InBarrier;
+    Weak_stage s = stage_bits_fld.decode(cb->weak_stage);
+    if (s == Weak_stage::Clean) {
+      desc.set_sweep_allocated();
+    }
+    tstruct.weak_signal = gc_handshake::Weak_signal::Working;
+  }
+
   void mark_bitmap::mark_gc_control_block() {
     //For this to work gc_control_block must be the first thing on the heap.
     _mark_end_first(0, (sizeof(gc_control_block) >> 3) - 1);
   }
+
   /*
    * Function to capture root pointers, both, external_gc_ptrs and persistent roots.
    */
@@ -211,23 +233,28 @@ namespace mpgc {
     cb.bitmap.mark_gc_control_block();
   }
   /*
-   * The main function that marks black an object. It enumerates all the pointers in the object and
-   * then marks it.
+   * The main function that marks black an object. It enumerates all
+   * the pointers in the object and then marks it.
    */
-  static void mark_black(const offset_ptr<const gc_allocated> &p, gc_control_block &cb, Traversal_queue &q) {
+  static void mark_black(const offset_ptr<const gc_allocated> &p,
+                         gc_control_block &cb,
+                         Traversal_queue &q) {
     //assert(p.is_valid() && p->get_gc_descriptor().is_valid());
     //assert(p.is_valid());
     if (!p.is_valid() || cb.bitmap.is_marked(p) || !p->get_gc_descriptor().is_valid()) {
       return;
     }
+    //p->get_gc_descriptor().atomic_clear_sweep_allocated();
     p->get_gc_descriptor().for_each_ref([&q, &cb](const base_offset_ptr *base_ptr) {
-      const offset_ptr<const gc_allocated> ptr = *base_ptr;
+      const offset_ptr<gc_allocated> ptr = *base_ptr;
       if (!ptr.is_null()) {
         assert(ptr.is_valid());
         bool marked = cb.bitmap.is_marked(ptr);
         if (ptr.is_weak()) {
           if (!marked) {
             cb.bitmap.mark_weak((std::size_t*)base_ptr);
+            weak_gc_ptr<gc_allocated>
+            ::clear_sweep_allocated(ptr);
           }
         } else if (!marked) {
           assert(ptr->get_gc_descriptor().is_valid());
@@ -844,15 +871,19 @@ namespace mpgc {
 
   static void post_sweep_weak_ptr_sync(gc_control_block &cb, per_process_struct *proc) {
     constexpr auto stage_bits_fld = bits::field<Weak_stage, uint16_t>(0, 2);
-    gc_handshake::in_memory_thread_struct_list_type &thread_list = gc_handshake::thread_struct_list;
+    gc_handshake::in_memory_thread_struct_list_type &thread_list =
+                                           gc_handshake::thread_struct_list;
     bool should_check = false;
 
     cb.weak_stage = stage_bits_fld.encode(Weak_stage::Normal);
 
     gc_handshake::in_memory_thread_struct *t = thread_list.head();
     while (t) {
-      gc_handshake::Weak_signal expected_weak_signal = gc_handshake::Weak_signal::InBarrier;
-      if (t->weak_signal.compare_exchange_strong(expected_weak_signal, gc_handshake::Weak_signal::DoHandshake)) {
+      gc_handshake::Weak_signal expected_weak_signal =
+                             gc_handshake::Weak_signal::InBarrier;
+      if (t->weak_signal.
+             compare_exchange_strong(expected_weak_signal,
+                                     gc_handshake::Weak_signal::DoHandshake)) {
         should_check = true;
       }
       if (request_gc_termination) {
@@ -881,7 +912,7 @@ namespace mpgc {
                   "sizeof gc_allocated larger than size_t");
     const std::size_t * const end = begin + size;
 
-    gc_control_block &cb = control_block();
+    // gc_control_block &cb = control_block();
     for (std::size_t s = 0; begin < end; begin += s) {
       const gc_descriptor &gc_desc
             = reinterpret_cast<gc_allocated*>(begin)->get_gc_descriptor();
@@ -896,8 +927,11 @@ namespace mpgc {
     assert(begin == end);
   }
 
-  static void put_to_global(gc_allocator::skiplist& list, chunk_expansion_slot &slot,
-                            const std::size_t beg_word, const std::size_t size,
+  static void put_to_global(gc_control_block &cb,
+                            gc_allocator::skiplist& list,
+                            chunk_expansion_slot &slot,
+                            const std::size_t beg_word,
+                            const std::size_t size,
                             std::mt19937 &rand) {
     /*
      * There are 2 ways that we can get a free chunk smaller than global_chunk (or local_chunk).
@@ -923,7 +957,7 @@ namespace mpgc {
     std::atomic_signal_fence(std::memory_order_release);
     slot.ptr = nullptr;
 
-    list.insert(control_block(), c, rand);
+    list.insert(cb, c, rand);
   }
 
   bool mark_bitmap::expand_free_chunk(std::size_t *heap_begin,
@@ -958,7 +992,8 @@ namespace mpgc {
      *    chunk, rather than the first one. Since all threads will try to do so,
      *    it resolves the concurrency.
      */
-    const bool is_not_obj = reinterpret_cast<gc_allocated*>(heap_begin + beg_word)->get_gc_descriptor().is_illegal();
+    const bool is_not_obj =
+      reinterpret_cast<gc_allocated*>(heap_begin + beg_word)->get_gc_descriptor().is_illegal();
  
     std::atomic_signal_fence(std::memory_order_acquire);
     if (is_marked(compute_bitmap_index(beg_word + 1), compute_bit_number(beg_word + 1))) {
@@ -980,7 +1015,7 @@ namespace mpgc {
     skiplist &prev_list = cb.global_free_lists[1 - curr_idx];
     skiplist &curr_list = cb.global_free_lists[curr_idx];
 
-    bump_chunk exp = prev_list.tail_node().bump_ptr;
+    bump_chunk exp{bump_chunk::from_volatile, prev_list.tail_node().bump_ptr};
     std::size_t *bump_chunk_first_word
            = reinterpret_cast<std::size_t*>(base_offset_ptr::base() +
                                            (exp.begin << alignment_log));
@@ -992,7 +1027,7 @@ namespace mpgc {
       //Work on bump pointer first
       prev_list.help_unfinished_bump_alloc();
 
-      bump_chunk exp = prev_list.tail_node().bump_ptr;
+      bump_chunk exp{bump_chunk::from_volatile, prev_list.tail_node().bump_ptr};
       if (exp.begin != 0 && exp.end != 0) {
         std::size_t end_word = key_fld.decode(prev_list.tail_node().level_orig_end);
         offset_ptr<global_chunk> tail_chunk
@@ -1086,7 +1121,7 @@ namespace mpgc {
                       reinterpret_cast<std::size_t*>(base_offset_ptr::base()) + beg_word);
       std::atomic_signal_fence(std::memory_order_release);
       slot.size = flag_fld.encode(1) | (end_word - beg_word);
-      put_to_global(curr_list, slot, beg_word, end_word - beg_word, rand);
+      put_to_global(cb, curr_list, slot, beg_word, end_word - beg_word, rand);
 
       /* We can set all the bits within the chunk to be set as they will not
        * have any dirty chunk.
@@ -1103,39 +1138,53 @@ namespace mpgc {
 
   static void adjust_inbound_weak_pointers(gc_control_block &cb) {
     inbound_pointers::inbound_weak_table::table(true)->for_each_slot([&cb](auto &wp) {
-      cb.bitmap.atomic_cleanup_weak_ptr(reinterpret_cast<size_t*>(&wp));
+      cb.bitmap.atomic_cleanup_weak_ptr(cb, reinterpret_cast<size_t*>(&wp));
     });
   }
 
-  void mark_bitmap::atomic_cleanup_weak_ptr(std::size_t *p) {
-    constexpr auto ptr_fld = bits::field<std::size_t, std::size_t>(0, base_offset_ptr::used_bits());
+  static void clear_sweep_allocated_inbound_weak_ptrs(gc_control_block &cb) {
+    inbound_pointers::inbound_weak_table::table(true)->for_each_slot([&cb](auto &wp) {
+      auto &p = wp.as_offset_pointer();
+      if (p != nullptr) {
+        weak_gc_ptr<gc_allocated>::clear_sweep_allocated(p);
+      }
+    });
+  }
+
+  void mark_bitmap::atomic_cleanup_weak_ptr(gc_control_block &cb, std::size_t *p) {
+    constexpr auto ptr_fld =
+       bits::field<std::size_t, std::size_t>(0, base_offset_ptr::used_bits());
     std::atomic<std::size_t> *atomic = reinterpret_cast<std::atomic<std::size_t>*>(p);
     std::size_t bare_exp = atomic->load();
-    base_offset_ptr exp = bare_exp;
+    //base_offset_ptr exp = bare_exp;
+    offset_ptr<const gc_allocated> exp(bare_exp);
     assert(exp.is_null() || (exp.is_weak() && exp.is_valid()));
     while (!exp.is_null() &&
-           !is_marked(&exp) &&
+           !weak_gc_ptr<const gc_allocated>::marked_or_sweep_allocated(cb, exp) &&
            !atomic->compare_exchange_weak(bare_exp, ptr_fld.replace(bare_exp, 0))) {
-      exp = bare_exp;
+      exp = offset_ptr<const gc_allocated>(bare_exp);
       assert(exp.is_null() || (exp.is_weak() && exp.is_valid()));
     }
   }
-
+/*
   void mark_bitmap::cleanup_weak_ptr(std::size_t *p) {
-    constexpr auto ptr_fld = bits::field<std::size_t, std::size_t>(0, base_offset_ptr::used_bits());
+    constexpr auto ptr_fld =
+       bits::field<std::size_t, std::size_t>(0, base_offset_ptr::used_bits());
     base_offset_ptr *off_ptr = reinterpret_cast<base_offset_ptr*>(p);
     assert(off_ptr->is_null() || (off_ptr->is_weak() && off_ptr->is_valid()));
     if (!off_ptr->is_null() && !is_marked(off_ptr)) {
       *p = ptr_fld.replace(*p, 0);
     }
   }
-
+*/
   void mark_bitmap::verify_weak_ptr_cleanup(std::size_t *p) {
     base_offset_ptr *ptr = reinterpret_cast<base_offset_ptr*>(p);
     assert(ptr->is_null() || (ptr->is_weak() && ptr->is_valid() && is_marked(ptr)));
   }
 
-  void mark_bitmap::cleanup_weak_ptrs(std::size_t begin, const std::size_t end) {
+  void mark_bitmap::cleanup_weak_ptrs(gc_control_block &cb,
+                                      std::size_t begin,
+                                      const std::size_t end) {
     const bit_number_t begin_bit = compute_bit_number(begin);
     bitmap_idx_t begin_idx = compute_bitmap_index(begin);
     const bit_number_t end_bit = compute_bit_number(end);
@@ -1143,14 +1192,14 @@ namespace mpgc {
     assert(begin_idx < end_idx || (begin_idx == end_idx && begin_bit <= end_bit));
     std::size_t * const base = reinterpret_cast<std::size_t*>(base_offset_ptr::base());
 
-    auto func = [this, base, end](rep_t val, std::size_t begin) {
+    auto func = [this, base, end, &cb](rep_t val, std::size_t begin) {
       while (val) {
         std::size_t clz = __builtin_clzl(val);
         assert(clz < bits_per_value);
         //NOTE:Shifting 64-bit is undefined. So we don't B <<= clz + 1.
         val <<= clz;
         begin += clz;
-        atomic_cleanup_weak_ptr(base + begin);
+        atomic_cleanup_weak_ptr(cb, base + begin);
         assert(begin <= end);
         begin++;
         val <<= 1;
@@ -1190,7 +1239,10 @@ namespace mpgc {
     }
   }
 
-  void mark_bitmap::process_logical_chunk(gc_allocator::skiplist &list, const std::size_t nr_chunk, const bool set_bit) {
+  void mark_bitmap::process_logical_chunk(gc_control_block &cb,
+                                          gc_allocator::skiplist &list,
+                                          const std::size_t nr_chunk,
+                                          const bool set_bit) {
     std::size_t first = 0;
     const std::size_t end = (nr_chunk + 1) << (chunk_size_log_bits + value_log_bits);
     std::size_t second;
@@ -1200,11 +1252,11 @@ namespace mpgc {
       if (second == end) {
         set_sweep_bitmap_both(0, set_bit);
         second = process_next_chunk_begin(1, set_bit);
-        put_to_global(list, gc_handshake::process_struct->get_sweep1_data(),
+        put_to_global(cb, list, gc_handshake::process_struct->get_sweep1_data(),
                       first, second - first, gc_handshake::process_struct->rand);
         return;
       } else {
-        put_to_global(list, gc_handshake::process_struct->get_sweep1_data(),
+        put_to_global(cb, list, gc_handshake::process_struct->get_sweep1_data(),
                       first, second - first, gc_handshake::process_struct->rand);
       }
     } else {
@@ -1215,7 +1267,7 @@ namespace mpgc {
     while (second < end) {
       first = find_next_free_word(second, end, dirty_end_bitmap);
       //Go through weak-bitmap to fix weak ptrs from second to first.
-      cleanup_weak_ptrs(second, first - 1);
+      cleanup_weak_ptrs(cb, second, first - 1);
       if (first == end) {
         rep_t B = _end[((nr_chunk + 1) << chunk_size_log_bits) - 1];
         if (B & 0x1) {
@@ -1230,7 +1282,7 @@ namespace mpgc {
           second = process_next_chunk_begin(nr_chunk + 1, set_bit);
         }
       }
-      put_to_global(list, gc_handshake::process_struct->get_sweep1_data(),
+      put_to_global(cb, list, gc_handshake::process_struct->get_sweep1_data(),
                     first, second - first, gc_handshake::process_struct->rand);
     }
 
@@ -1290,7 +1342,7 @@ namespace mpgc {
         break;
       }
       if (!is_end_sweep_bitmap_set(i, set_bitmap)) {
-        process_logical_chunk(list, i, set_bitmap);
+        process_logical_chunk(cb, list, i, set_bitmap);
       }
     } while (true);
   }
@@ -1362,6 +1414,8 @@ namespace mpgc {
   void mark_bitmap::_cleanup_sweep1_phase(per_process_struct *p, gc_allocator::skiplist &list, const bool set_bitmap) {
     constexpr auto flag_fld = bits::field<uint8_t, std::size_t>(63, 1);
     constexpr auto size_fld = bits::field<std::size_t, std::size_t>(0, 63);
+
+    gc_control_block &cb = control_block();
     chunk_expansion_slot *dead_slot_ptr = p->sweep1_data_ptr();
     Mutator_persist_list &mb_list = p->mutator_persist_list();
     Mpersist *mpersist = nullptr;
@@ -1372,7 +1426,9 @@ namespace mpgc {
         if (flag_fld.decode(dead_slot.size) == 1) {
           std::size_t beg_word = dead_slot.ptr.offset() >> 3;
           std::size_t end_word = size_fld.decode(dead_slot.size) + beg_word;
-          put_to_global(list, dead_slot, beg_word, size_fld.decode(dead_slot.size), gc_handshake::process_struct->rand);
+          put_to_global(cb, list, dead_slot, 
+                        beg_word, size_fld.decode(dead_slot.size),
+                        gc_handshake::process_struct->rand);
           /* We can set all the bits within the chunk to be set as they will not
            * have any dirty chunk.
            */
@@ -1384,7 +1440,10 @@ namespace mpgc {
           }
           set_sweep_bitmap_range(beg_word, end_word - 1, set_bitmap);
         } else {
-          expand_and_put_chunk(control_block(), list, dead_slot, set_bitmap, gc_handshake::process_struct->rand);
+          expand_and_put_chunk(cb, list,
+                               dead_slot,
+                               set_bitmap,
+                               gc_handshake::process_struct->rand);
         }
       }
 
@@ -1614,6 +1673,7 @@ namespace mpgc {
           if (request_gc_termination) {
             break;
           }
+          clear_sweep_allocated_inbound_weak_ptrs(cb);
           //Main marking phase
           marking_phase(*gc_handshake::process_struct);
           if (request_gc_termination) {
@@ -1718,7 +1778,7 @@ namespace mpgc {
       if (request_gc_termination) {
         {
           std::lock_guard<std::mutex> lk(gc_termination_mutex);
-          request_gc_termination = false;
+          request_gc_termination = 2;
         }
         gc_terminated.notify_all();
         return;
@@ -1745,8 +1805,8 @@ namespace mpgc {
    * termination is requested.
    */
   void atexit_gc_handler() {
-    request_gc_termination = true;
+    request_gc_termination = 1;
     std::unique_lock<std::mutex> lk(gc_termination_mutex);
-    gc_terminated.wait(lk, []{return !request_gc_termination;});
+    gc_terminated.wait(lk, []{return request_gc_termination > 1;});
   }
 }

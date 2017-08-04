@@ -143,17 +143,20 @@ namespace mpgc {
       _info.bstage = s;
     }
 
-    marking_barrier_type(const marking_barrier_type &rhs) noexcept : _data(rhs._data) {}
-    marking_barrier_type(marking_barrier_type &&rhs) noexcept : _data(std::move(rhs._data)) {}
+    marking_barrier_type(const marking_barrier_type &rhs) noexcept = default;
+    marking_barrier_type(marking_barrier_type &&rhs) noexcept = default;
+    // marking_barrier_type(const marking_barrier_type &rhs) noexcept : _data(rhs._data) {}
+    // marking_barrier_type(marking_barrier_type &&rhs) noexcept : _data(std::move(rhs._data)) {}
 
-    marking_barrier_type &operator =(const marking_barrier_type &rhs) noexcept {
-      _data = rhs._data;
-      return *this;
-    }
-    marking_barrier_type &operator =(marking_barrier_type &&rhs) noexcept {
-      _data = std::move(rhs._data);
-      return *this;
-    }
+    marking_barrier_type &operator =(const marking_barrier_type &rhs) noexcept = default;
+    marking_barrier_type &operator =(marking_barrier_type &&rhs) noexcept = default;    // marking_barrier_type &operator =(const marking_barrier_type &rhs) noexcept {
+    //   _data = rhs._data;
+    //   return *this;
+    // }
+    // marking_barrier_type &operator =(marking_barrier_type &&rhs) noexcept {
+    //   _data = std::move(rhs._data);
+    //   return *this;
+    // }
   };
 
   enum struct gc_mutator_weak_sync_state {
@@ -745,17 +748,22 @@ namespace mpgc {
       }
     }
 
-    bool expand_free_chunk(std::size_t*, offset_ptr<gc_allocator::global_chunk>, std::size_t, std::size_t&, std::size_t&);
+    bool expand_free_chunk(std::size_t*,
+                           offset_ptr<gc_allocator::global_chunk>,
+                           std::size_t, std::size_t&, std::size_t&);
     void post_sweep_phase(per_process_struct*, const bool);
     bool post_sweep_phase_without_load_balancing(per_process_struct*, const bool);
     void post_sweep_clear(const std::size_t, const bool);
-    void process_logical_chunk(gc_allocator::skiplist&, const std::size_t, const bool);
+    void process_logical_chunk(gc_control_block&,
+                               gc_allocator::skiplist&,
+                               const std::size_t,
+                               const bool);
     void _cleanup_sweep1_phase(per_process_struct*, gc_allocator::skiplist&, const bool);
-    void cleanup_weak_ptrs(std::size_t, const std::size_t);
+    void cleanup_weak_ptrs(gc_control_block&, std::size_t, const std::size_t);
     void verify_weak_ptrs_cleanup();
     void verify_weak_ptr_cleanup(std::size_t*);
-    void cleanup_weak_ptr(std::size_t*);
-    void atomic_cleanup_weak_ptr(std::size_t*);
+    //void cleanup_weak_ptr(std::size_t*);
+    void atomic_cleanup_weak_ptr(gc_control_block&, std::size_t*);
     void set_sweep_bitmap_range(const std::size_t, const std::size_t, const bool);
     void expand_and_put_chunk(gc_control_block&, gc_allocator::skiplist&, chunk_expansion_slot&, const bool, std::mt19937&);
     void sweep1_phase(gc_control_block&, chunk_expansion_slot&, std::mt19937&,const uint8_t, const bool, const bool);

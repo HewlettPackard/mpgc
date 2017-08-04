@@ -210,7 +210,7 @@ namespace std {
     using base::load;
 
     atomic(const contained_type &desired) {
-      mpgc::weak_gc_ptr<T>::write_barrier(this,
+      mpgc::weak_gc_ptr<T>::write_barrier(this, &desired,
         [&desired]{return desired.pointer().as_offset_pointer();},
         [&](mpgc::offset_ptr<T> &p) {
           base(reinterpret_cast<contained_type&>(p).set(ruts::version_num(desired.version()),
@@ -232,7 +232,7 @@ namespace std {
     void store(const contained_type &desired,
                std::memory_order order = std::memory_order_seq_cst)
     {
-      mpgc::weak_gc_ptr<T>::write_barrier(this,
+      mpgc::weak_gc_ptr<T>::write_barrier(this, &desired,
         [&desired]{return desired.pointer().as_offset_pointer();},
         [&](mpgc::offset_ptr<T> &p) {
           base::store(reinterpret_cast<contained_type&>(p).set(ruts::version_num(desired.version()),
@@ -245,7 +245,7 @@ namespace std {
     void store(const contained_type &desired,
                std::memory_order order = std::memory_order_seq_cst) volatile
     {
-      mpgc::weak_gc_ptr<T>::write_barrier(this,
+      mpgc::weak_gc_ptr<T>::write_barrier(this, &desired,
         [&desired]{return desired.pointer().as_offset_pointer();},
         [&](mpgc::offset_ptr<T> &p) {
           base::store(reinterpret_cast<contained_type&>(p).set(ruts::version_num(desired.version()),
@@ -259,7 +259,7 @@ namespace std {
                             std::memory_order order = std::memory_order_seq_cst)
     {
       contained_type ret;
-      mpgc::weak_gc_ptr<T>::write_barrier(this,
+      mpgc::weak_gc_ptr<T>::write_barrier(this, &desired,
         [&desired]{return desired.pointer().as_offset_pointer();},
         [&](mpgc::offset_ptr<T> &p) {
           ret = base::exchange(reinterpret_cast<contained_type&>(p)
@@ -275,7 +275,7 @@ namespace std {
                             std::memory_order order = std::memory_order_seq_cst) volatile
     {
       contained_type ret;
-      mpgc::weak_gc_ptr<T>::write_barrier(this,
+      mpgc::weak_gc_ptr<T>::write_barrier(this, &desired,
         [&desired]{return desired.pointer().as_offset_pointer();},
         [&](mpgc::offset_ptr<T> &p) {
           ret = base::exchange(reinterpret_cast<contained_type&>(p)
@@ -293,7 +293,7 @@ namespace std {
                                std::memory_order failure)
     {
       bool ret;
-      mpgc::weak_gc_ptr<T>::write_barrier(this,
+      mpgc::weak_gc_ptr<T>::write_barrier(this, &desired,
         [&desired]{return desired.pointer().as_offset_pointer();},
         [&](mpgc::offset_ptr<T> &p) {
           ret = base::compare_exchange_weak(expected,
@@ -319,7 +319,7 @@ namespace std {
                                std::memory_order failure) volatile
     {
       bool ret;
-      mpgc::weak_gc_ptr<T>::write_barrier(this,
+      mpgc::weak_gc_ptr<T>::write_barrier(this, &desired,
         [&desired]{return desired.pointer().as_offset_pointer();},
         [&](mpgc::offset_ptr<T> &p) {
           ret = base::compare_exchange_weak(expected,
@@ -350,7 +350,7 @@ namespace std {
     {
       // mark expected
       bool ret;
-      mpgc::weak_gc_ptr<T>::write_barrier(this,
+      mpgc::weak_gc_ptr<T>::write_barrier(this, &desired,
         [&desired]{return desired.pointer().as_offset_pointer();},
         [&](mpgc::offset_ptr<T> &p) {
           ret = base::compare_exchange_strong(expected,
@@ -376,7 +376,7 @@ namespace std {
                                  std::memory_order failure) volatile
     {
       bool ret;
-      mpgc::weak_gc_ptr<T>::write_barrier(this,
+      mpgc::weak_gc_ptr<T>::write_barrier(this, &desired,
         [&desired]{return desired.pointer().as_offset_pointer();},
         [&](mpgc::offset_ptr<T> &p) {
           ret = base::compare_exchange_strong(expected,

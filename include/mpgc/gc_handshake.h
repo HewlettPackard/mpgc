@@ -49,6 +49,7 @@
 #include <pthread.h>
 
 #include "ruts/collections.h"
+#include "ruts/managed.h"
 
 #include "mpgc/mark_buffer.h"
 #include "mpgc/gc_thread.h"
@@ -58,7 +59,7 @@ namespace std {
   extern void cpu_relax();
 }
 namespace mpgc {
-  extern volatile bool request_gc_termination;
+  extern volatile uint8_t request_gc_termination;
   namespace gc_handshake {
     extern void initialize1();
     extern void initialize2();
@@ -113,9 +114,15 @@ namespace mpgc {
         Live
       };
 
+      using on_stack_wp_set_type = std::unordered_set<const void*,
+                                                      std::hash<const void*>,
+                                                      std::equal_to<const void*>,
+                                                      ruts::managed_space::allocator<const void*>>;
+
+      on_stack_wp_set_type on_stack_wp_set;
       gc_allocator::localPoolType local_free_list;
-      const pthread_t pthread;
       std::mt19937 rand;
+      const pthread_t pthread;
       uint8_t * const stack_end;
       mutator_persist * const persist_data;
       mark_bitmap * const bitmap;
@@ -143,8 +150,8 @@ namespace mpgc {
       }
 
       in_memory_thread_struct() :
-          pthread(pthread_self()),
           rand(pthread),
+          pthread(pthread_self()),
           stack_end(compute_stack_addr(pthread)),
           persist_data(process_struct->mutator_persist_list().insert()),
           bitmap(mbitmap),
