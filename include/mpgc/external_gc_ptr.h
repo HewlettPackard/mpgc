@@ -279,9 +279,14 @@ namespace mpgc {
               auto &slot = _table[i];
               _free = slot.next_free;
               slot.reset(gcp);
-              auto deleter = [i](target_base *) {
+              auto deleter = [i](target_base *tb) {
+                // std::cout << "// Dropping external " << typeid(T).name()
+                // << ": " << offset_ptr<target_base>(tb) << std::endl;
+
                 ic_control::block().release(i);
               };
+              // std::cout << "// Creating external " << typeid(T).name()
+              // << ": " << offset_ptr<target_base>(ptr) << std::endl;
               std::shared_ptr<target_base> res{ptr, deleter};
               return res;
             };
@@ -1056,7 +1061,7 @@ namespace mpgc {
 
     ~external_weak_gc_ptr() noexcept {
       if (!request_gc_termination && _slot != nullptr) {
-        iwt::release_slot(_slot);
+        iwt::drop_reference(_slot);
         _slot = nullptr;
       }
     }
