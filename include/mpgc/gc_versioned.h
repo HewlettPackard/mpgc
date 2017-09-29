@@ -35,16 +35,16 @@
 namespace mpgc {
 
   template <typename T, std::size_t NFlags = 0>
-  using versioned_gc_ptr = ruts::versioned<gc_ptr<T>, NFlags, base_offset_ptr::used_bits()>;
+  using versioned_gc_ptr = ruts::versioned<gc_ptr<T>, NFlags>;
 
   template <typename T, std::size_t NFlags = 0>
-  using atomic_versioned_gc_ptr = ruts::atomic_versioned<gc_ptr<T>, NFlags, base_offset_ptr::used_bits()>;
+  using atomic_versioned_gc_ptr = ruts::atomic_versioned<gc_ptr<T>, NFlags>;
 
   template <typename T, std::size_t NFlags = 0>
-  using versioned_weak_gc_ptr = ruts::versioned<weak_gc_ptr<T>, NFlags, base_offset_ptr::used_bits()>;
+  using versioned_weak_gc_ptr = ruts::versioned<weak_gc_ptr<T>, NFlags>;
 
   template <typename T, std::size_t NFlags = 0>
-  using atomic_versioned_weak_gc_ptr = ruts::atomic_versioned<weak_gc_ptr<T>, NFlags, base_offset_ptr::used_bits()>;
+  using atomic_versioned_weak_gc_ptr = ruts::atomic_versioned<weak_gc_ptr<T>, NFlags>;
 }
 
 namespace std {

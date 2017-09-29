@@ -37,7 +37,6 @@ namespace mpgc {
   namespace gc_handshake {
     struct in_memory_thread_struct;
   }
-  extern void install_descriptor_epilogue(gc_descriptor&);
 
   namespace gc_allocator {
     class bump_allocation_slots;
@@ -81,7 +80,6 @@ namespace mpgc {
       : _descriptor(gc_descriptor::install{}, gc.descriptor)
     {
       //assert(_descriptor.is_valid());
-      install_descriptor_epilogue(_descriptor);
     }
   public:
     /*

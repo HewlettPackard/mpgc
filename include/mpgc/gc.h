@@ -41,6 +41,7 @@
 #include "mpgc/gc_array.h"
 #include "mpgc/gc_skiplist_allocator.h"
 #include "mpgc/gc_ptr.h"
+#include "mpgc/on_stack_ptr.h"
 #include "mpgc/gc_allocate.h"
 #include "mpgc/gc_versioned.h"
 #include "mpgc/gc_virtuals.h"
@@ -50,6 +51,7 @@
 #include "mpgc/gc_cuckoo_map.h"
 #include "mpgc/weak_gc_ptr.h"
 #include "mpgc/contingent_gc_ptr.h"
+#include "mpgc/weak_ctrl_map.h"
 #include "mpgc/bump_allocation_slots.h"
 
 #include "ruts/collections.h"
@@ -336,6 +338,8 @@ namespace mpgc {
 
     gc_mem_stats mem_stats;
 
+    weak_ctrl_map ctrl_map;
+
     //Total number of processes at any time
     std::atomic<versioned_pcount_t> total_process_count;
 
@@ -376,6 +380,26 @@ namespace mpgc {
   extern gc_control_block &control_block();
   extern void init_on_createheap();
 
+  class bad_white_alloc : public std::bad_alloc {
+    virtual const char* what() const noexcept {
+      return "Please create a larger heap!";
+    }
+  };
+
+  template<typename T>
+  inline
+  typename white_allocator<T>::pointer white_allocator<T>::allocate(const size_t n) throw() {
+    static_assert(alignof(T) <= 8, "White allocation doesn't respect special alignment requests.");
+    gc_control_block &cb = control_block();
+    gc_status status = gc_handshake::process_struct->get_gc_status();
+    void *ret = cb.global_free_lists[status.status_idx.idx]
+                  .allocate(cb, sizeof(T) * n);
+    if (ret == nullptr) {
+      throw bad_white_alloc{};
+    }
+    return static_cast<T*>(ret);
+  }
+
   inline
   persistent_roots_t &persistent_roots() {
     initialize_thread();
@@ -409,7 +433,7 @@ namespace ruts {
   template <>
   struct hash2<mpgc::persistent_root_key> {
     auto operator()(const mpgc::persistent_root_key &key) const {
-      return hash1<uniform_key>{}(key.id);
+      return hash2<uniform_key>{}(key.id);
     }
   };
 }

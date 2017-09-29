@@ -374,17 +374,16 @@ namespace mpgc {
               return true;
             } else {
               //Couldn't put a new chunk as bump chunk. Try with 'chunk'
-              return !insert_chunk_for_bump_alloc(chunk);
+              return chunk && !insert_chunk_for_bump_alloc(chunk);
             }
         }
         return true;
       }
 
-      offset_ptr<skip_node> allocate_skip_node(gc_control_block &cb,
-                                               uint8_t &level,
-                                               const std::size_t size,
-                                               offset_ptr<global_chunk> c) {
-        std::size_t alloc_sz = (level * sizeof(offset_ptr<skip_node>) + sizeof(skip_node)) >> alignment_log;
+      std::pair<void*, std::size_t> allocate_bump_end(gc_control_block &cb,
+                                                   const std::size_t req_sz,
+                                                   const std::size_t min_sz,
+                                                   offset_ptr<global_chunk> c) {
         bump_chunk exp{bump_chunk::from_volatile, tail.bump_ptr};
         std::atomic_signal_fence(std::memory_order_release);
         bump_chunk des;
@@ -402,37 +401,52 @@ namespace mpgc {
             }
           }
           std::size_t diff = bump_ptr_fld.decode(exp.end) - bump_ptr_fld.decode(exp.begin);
-          if (diff >= alloc_sz) {
+          if (diff >= req_sz) {
             des.begin = exp.begin;
-            uint64_t target_end = bump_ptr_fld.decode(exp.end) - alloc_sz;
+            uint64_t target_end = bump_ptr_fld.decode(exp.end) - req_sz;
             des.end = bump_ptr_fld.replace(exp.end, target_end);
             if (tail.atomic_bump_ptr.compare_exchange_strong(exp, des)) {
-              skip_node *ret = new (base_offset_ptr::base() + ((target_end + 1)<< alignment_log)) skip_node(level, size);
-              return ret;
+              return std::make_pair(base_offset_ptr::base() + ((target_end + 1) << alignment_log), req_sz);
             }
           } else {
             if (diff > 0) {
               //pull out whatever is remaining.
               des.begin = des.end = exp.begin;
               if (tail.atomic_bump_ptr.compare_exchange_strong(exp, des)) {
-                if (diff >= (sizeof(skip_node) >> alignment_log)) {
-                  //If we have enough space to fit a skip node with level 0, we'll do it
-                  level = diff - (sizeof(skip_node) >> alignment_log);
-                  skip_node *ret = new (base_offset_ptr::base() + ((des.begin + 1) << alignment_log)) skip_node(level, size);
-                  return ret;
-                } 
+                if (diff >= min_sz) {
+                  return std::make_pair(base_offset_ptr::base() + ((des.begin + 1) << alignment_log), diff);
+                }
               } else {
                 continue;
               }
             }
             if (!replace_bump_chunk(cb, c)) {
               //This means that chunk c has been added as bump chunk and hence there is no need to allocate skip node.
-              return nullptr;
+              return std::make_pair(nullptr, 0);
             }
             exp = bump_chunk{bump_chunk::from_volatile, tail.bump_ptr};
           }
         } while(true);
       }
+
+      offset_ptr<skip_node> allocate_skip_node(gc_control_block &cb,
+                                               uint8_t &level,
+                                               const std::size_t size,
+                                               offset_ptr<global_chunk> c) {
+        const std::size_t req_sz = (level * sizeof(offset_ptr<skip_node>) + sizeof(skip_node)) >> alignment_log;
+        void *ret_ptr;
+        std::size_t ret_sz;
+        std::tie(ret_ptr, ret_sz) = allocate_bump_end(cb, req_sz, sizeof(skip_node) >> alignment_log, c);
+        if (ret_ptr) {
+          if (ret_sz < req_sz) {
+            level = ret_sz - (sizeof(skip_node) >> alignment_log);
+          }
+          return new (ret_ptr) skip_node(level, size);
+        } else {
+          return nullptr;
+        }
+      }
+
       bool _help_unfinished_bump_alloc(gc_control_block&, bump_chunk&, bump_chunk&,
                                        slot_number&, slot_number&, bool);
 
@@ -562,6 +576,14 @@ namespace mpgc {
           }//if
           break;
         }
+      }
+
+      void* allocate(gc_control_block &cb,
+                     std::size_t size) {
+        size = align_size_up(size, alignment) >> alignment_log;
+        void *ret_ptr;
+        std::tie(ret_ptr, std::ignore) = allocate_bump_end(cb, size, size, nullptr);
+        return ret_ptr;
       }
 
       offset_ptr<global_chunk> allocate(gc_control_block &cb,

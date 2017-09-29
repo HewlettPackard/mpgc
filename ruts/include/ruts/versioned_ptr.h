@@ -54,7 +54,7 @@ namespace std {
   template <typename Ptr>
   struct default_versioned_pointer_traits : pointer_traits<Ptr> {
     using prim_rep = typename pointer_traits<Ptr>::element_type*;
-
+    constexpr static size_t AddressBits = 48;
     template <typename M>
     constexpr static void construct_prim_rep(const void *loc,
                                              const Ptr &p,
@@ -98,7 +98,7 @@ namespace std {
 namespace ruts {
   class version_num {
   public:
-    using rep_type = unsigned;
+    using rep_type = std::size_t;
   private:
     rep_type _version;
   public:
@@ -123,14 +123,14 @@ namespace ruts {
     }
   };
 
-  template <typename Ptr, std::size_t NFlags = 0, std::size_t N = 48>
+  template <typename Ptr, std::size_t NFlags = 0, std::size_t N = std::versioned_pointer_traits<Ptr>::AddressBits>
   class versioned;
-  template <typename Ptr, std::size_t NFlags = 0, std::size_t N = 48>
+  template <typename Ptr, std::size_t NFlags = 0, std::size_t N = std::versioned_pointer_traits<Ptr>::AddressBits>
   class atomic_versioned;
 
-  template <typename T, std::size_t NFlags = 0, std::size_t N = 48>
+  template <typename T, std::size_t NFlags = 0, std::size_t N = std::versioned_pointer_traits<T*>::AddressBits>
   using versioned_ptr = versioned<T*,NFlags,N>;
-  template <typename T, std::size_t NFlags = 0, std::size_t N = 48>
+  template <typename T, std::size_t NFlags = 0, std::size_t N = std::versioned_pointer_traits<T*>::AddressBits>
   using atomic_versioned_ptr = atomic_versioned<T*,NFlags,N>;
 
   template <typename T>

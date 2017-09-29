@@ -34,12 +34,12 @@
 #ifndef LF_STACK_H_
 #define LF_STACK_H_
 
-#include "atomic16B.h"
-
 #include<cstddef>
 #include<atomic>
 #include<memory>
 #include<cassert>
+
+#include "versioned_ptr.h"
 /*
  * This class provides a lock-free unbounded stack implemented
  * using a singly linked-list.
@@ -63,22 +63,14 @@ namespace ruts {
        T value;
        pointer<entry> next;
      };
-
-     struct alignas(16) versioned_head {
-       pointer<entry> ptr;
-       std::size_t version;
-
-       versioned_head() : ptr(nullptr), version(0) {}
-       versioned_head(pointer<entry> p, std::size_t v) : ptr(p), version(v) {}
-     };
-
      using entry_allocator_type = typename std::allocator_traits<A>::template rebind_alloc<entry>;
+     using versioned_head_t = versioned<pointer<entry>>;
 
-     atomic16B<versioned_head> _head;
+     typename versioned_head_t::atomic_pointer _head;
      entry_allocator_type alloc;
 
   public:
-     lf_stack() : _head(versioned_head()), alloc() {
+     lf_stack() : _head(nullptr), alloc() {
      }
 
      ~lf_stack() {
@@ -86,64 +78,84 @@ namespace ruts {
      }
 
      constexpr pointer<T> head() const {
-       pointer<entry> p = _head.load().ptr;
-       return p ? &p->value : nullptr;
+       pointer<entry> p = _head;
+       return p != nullptr ? &p->value : nullptr;
      }
 
-     constexpr bool empty() const { return _head.load().ptr == nullptr;}
+     constexpr pointer<T> next(pointer<T> p) const {
+       pointer<entry> e = reinterpret_cast<entry*>(static_cast<uint8_t*>(static_cast<void*>(p)) -
+                                                   offsetof(entry, value));
+       e = e->next;
+       return e != nullptr ? &e->value : nullptr;
+     }
+
+     constexpr bool empty() const { return _head == nullptr;}
 
      void clear() {
-       versioned_head temp = _head;
-       if (temp.ptr == nullptr)
-         return;
-
-       while (true) {
-         while(!_head.compare_exchange_weak(temp, versioned_head(temp.ptr->next, temp.version + 1)));
-         if (temp.ptr) {
-           temp.ptr->value.~T();
-           alloc.deallocate(temp.ptr, 1);
+       versioned_head_t temp = _head.contents();
+       while (temp != nullptr) {
+         auto ret = _head.inc_and_change(temp, temp->next);
+         if (ret.succeeded) {
+           temp->value.~T();
+           pointer<entry> n = temp->next;
+           alloc.deallocate(temp, 1);
+           temp = n;
          } else {
-           break;
+           temp = ret.prior_value;
          }
        }
      }
 
      template <typename ...Args>
+     void static construct(void *p, Args&&... args) {
+       new (p) T(std::forward<Args>(args)...);
+       static_cast<entry*>(p)->next = nullptr;
+     }
+
+     template <typename ...Args>
      pointer<T> allocate(Args&&... args) {
        pointer<entry> e = alloc.allocate(1);
-       T* p = &(e->value);
-       new (p) T(std::forward<Args>(args)...);
-       e->next = nullptr;
-       return p;
+       construct(static_cast<void*>(e), std::forward<Args>(args)...);
+       return &(e->value);
      }
      //NOTE:We must ensure that we convert pointer<T> to void* using static_cast and not reinterpret_cast. This is
      //because typecast operator may be overloaded (like in offset_ptr) in some cases.
      void push(pointer<T> p) {
-       pointer<entry> e = reinterpret_cast<entry*>(static_cast<uint8_t*>(static_cast<void*>(p)) - offsetof(entry, value));
-       versioned_head exp = _head;
-       do {
-         e->next = exp.ptr;
-       } while(!_head.compare_exchange_weak(exp, versioned_head(e, exp.version + 1)));
+       pointer<entry> e = reinterpret_cast<entry*>(static_cast<uint8_t*>(static_cast<void*>(p)) -
+                                                   offsetof(entry, value));
+       _head.update([&e](versioned_head_t h) {
+                      e->next = h;
+                      h.inc_and_set(e);
+                      return h;
+                    });
      }
 
      void push(pointer<T> begin, pointer<T> end) {
-       pointer<entry> b = reinterpret_cast<entry*>(static_cast<uint8_t*>(static_cast<void*>(begin)) - offsetof(entry, value));
-       pointer<entry> e = reinterpret_cast<entry*>(static_cast<uint8_t*>(static_cast<void*>(end)) - offsetof(entry, value));
-       versioned_head exp = _head;
-       do {
-         e->next = exp.ptr;
-       } while(!_head.compare_exchange_weak(exp, versioned_head(b, exp.version + 1)));
+       pointer<entry> b = reinterpret_cast<entry*>(static_cast<uint8_t*>(static_cast<void*>(begin)) -
+                                                   offsetof(entry, value));
+       pointer<entry> e = reinterpret_cast<entry*>(static_cast<uint8_t*>(static_cast<void*>(end)) -
+                                                   offsetof(entry, value));
+       _head.update([&b, &e](versioned_head_t h) {
+                     e->next = h;
+                     h.inc_and_set(b);
+                     return h;
+                    });
      }
 
      void pop(pointer<T> &ret) {
-       versioned_head exp = _head;
-       while (exp.ptr) {
-         ret = &(exp.ptr->value);
-         if (_head.compare_exchange_weak(exp, versioned_head(exp.ptr->next, exp.version + 1))){
-           return;
-         }
-       }
-       ret = nullptr;
+       _head.try_update([&](const versioned_head_t& h) {
+                          if (h == nullptr) {
+                            ret = nullptr;
+                            return false;
+                          } else {
+                            return true;
+                          }
+                        }, 
+                        [&](versioned_head_t h) {
+                          ret = &(h->value);
+                          h.inc_and_set(h->next);
+                          return h;
+                        });
      }
 
      void deallocate(pointer<T> e) {

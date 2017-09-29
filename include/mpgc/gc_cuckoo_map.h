@@ -49,18 +49,61 @@
 #include "ruts/cas_loop.h"
 
 namespace mpgc {
+  template <typename K>
+  struct key_expired {
+    template <typename X=K, typename = decltype(std::declval<X>().expired())>
+    static bool test(const K &k) noexcept {
+      return k.expired();
+    }
+
+    static bool test(...) noexcept {
+      return false;
+    }
+  };
+
+  template <typename K, typename V>
+  struct entry_expired {
+    static bool test(const K &k, const V &v) noexcept {
+      return key_expired<K>::test(k) || key_expired<V>::test(v);
+    }
+  };
 
   template <std::size_t Cap, std::size_t Bits, std::size_t Size, typename Enable = void> struct __bits_needed;
 
-  template <typename K, typename V, typename Hash1=ruts::hash1<K>, typename Hash2=ruts::hash2<K>,
-      std::size_t SegBits = 10>
+  template <typename K, typename V>
+  struct cuckoo_map_traits {
+    using key_type = K;
+    using value_type = V;
+    using hash1_fn_type = ruts::hash1<std::decay_t<K>>;
+    using hash2_fn_type = ruts::hash2<std::decay_t<K>>;
+
+    static bool expired(const K &k, const V &v) noexcept {
+      using ee = entry_expired<std::decay_t<K>,std::decay_t<V>>;
+      return ee::test(k, v);
+    }
+
+    constexpr static std::size_t n_seg_bits = 10;
+    constexpr static std::size_t default_initial_segment_bits = 10;
+  };
+
+  template <typename Traits>
+  struct small_cuckoo_map_traits : Traits {
+    constexpr static std::size_t n_seg_bits = 0;
+    constexpr static std::size_t default_initial_segment_bits = 4;
+  };
+
+
+  template <typename K, typename V, typename Traits = cuckoo_map_traits<K,V>,
+            std::size_t SegBits = Traits::n_seg_bits>
   class gc_cuckoo_map : public gc_allocated {
   public:
     using key_type = K;
     using value_type = V;
 
-    using hash1_fn_type = Hash1;
-    using hash2_fn_type = Hash2;
+    using traits_type = Traits;
+    
+    using hash1_fn_type = typename traits_type::hash1_fn_type;
+    using hash2_fn_type = typename traits_type::hash2_fn_type;
     using hash_type = uint64_t;
 
     /**
@@ -87,6 +130,10 @@ namespace mpgc {
 	  .template WITH_FIELD(&entry_type::val);
         return d;
       }
+
+      bool expired() const noexcept {
+        return traits_type::expired(key, val);
+      }
     };
 
     constexpr static std::size_t num_flags = 2;
@@ -106,7 +153,8 @@ namespace mpgc {
     constexpr static std::size_t n_tables = 2;
     constexpr static std::size_t n_seg_bits = SegBits;
     constexpr static std::size_t max_eviction_depth = 8;
-    constexpr static std::size_t default_initial_segment_bits = 10;
+    constexpr static std::size_t default_initial_segment_bits =
+      traits_type::default_initial_segment_bits;
     constexpr static std::size_t max_segment_slot_bits = 64-n_seg_bits;
     constexpr static std::size_t default_cap = 1 << (n_seg_bits + default_initial_segment_bits);
 
@@ -236,14 +284,14 @@ namespace mpgc {
       bool matches(const key_type &key, const entry_ptr_type &ep) const
       {
         pointer<entry_type> e = ep.pointer();
-        return (e != nullptr && !moving(ep) && e->key == key);
+        return (e != nullptr && !moving(ep) && e->key == key && !e->expired());
       }
 
       bool replace_null(const pointer<entry_type> &with, hash_type hash) {
         atomic_entry_ptr_type &s = *slot(hash);
 
         auto guard = [=](const entry_ptr_type &ep) {
-          return ep == nullptr && !ep[frozen];
+          return (ep == nullptr || ep->expired()) && !ep[frozen];
         };
 
         auto change = [=](entry_ptr_type ep) {
@@ -302,7 +350,7 @@ namespace mpgc {
 	    return false;
 	  }
 	  auto ptr = ep.pointer();
-	  if (ptr == nullptr) {
+	  if (ptr == nullptr || ptr->expired()) {
 	    return true;
 	  }
 	  return (ptr->key == current->key 
@@ -391,7 +439,7 @@ namespace mpgc {
           // the one who did succeeded in copying it.
           entry_ptr_type ep = ur.new_value;
           pointer<entry_type> e = ep;
-          if (e != nullptr) {
+          if (e != nullptr && !e->expired()) {
             // Find the slot in the replacement.
             hash_type h = _hash(e->key);
             std::size_t i = r->slot_index(h);
@@ -643,12 +691,12 @@ namespace mpgc {
         // we loop until we succeed in moving or until we get told it's impossible
 
         entry_ptr_type left_current = left_source.contents();
-        if (left_current == nullptr && !left_current[frozen]) {
+        if ((left_current == nullptr || left_current->expired()) && !left_current[frozen]) {
           // there's no point in moving nothing.
           return side::LEFT;
         }
         entry_ptr_type right_current = right_source.contents();
-        if (right_current == nullptr &&!right_current[frozen]) {
+        if ((right_current == nullptr || right_current->expired())  &&!right_current[frozen]) {
           // there's no point in moving nothing.
           return side::RIGHT;
         }
@@ -711,7 +759,7 @@ namespace mpgc {
       for (std::size_t d = 0; d < max_eviction_depth; d++) {
         slot_ref slot = t->slot(key);
         pointer<entry_type> e = slot.contents();
-        if (e == nullptr) {
+        if (e == nullptr || e->expired()) {
           // There's an open slot.  No point in continuing.
           best = nullptr;
           return;
@@ -842,14 +890,15 @@ namespace mpgc {
     }
 
   public:
-    gc_cuckoo_map(gc_token &gc, const hash1_fn_type &h1, const hash2_fn_type &h2, std::size_t capacity = default_cap) :
+    gc_cuckoo_map(gc_token &gc, const hash1_fn_type &h1, const hash2_fn_type &h2,
+                  std::size_t capacity = default_cap) :
       gc_allocated{gc},
       _left_table{make_gc<table>(GC_THIS, side::LEFT, h1, h2, slot_bits_for(capacity))},
       _right_table{make_gc<table>(GC_THIS, side::RIGHT, h1, h2, slot_bits_for(capacity))}
       {}
 
     explicit gc_cuckoo_map(gc_token &gc, std::size_t capacity = default_cap) :
-        gc_cuckoo_map(gc, hash1_fn_type{}, hash2_fn_type{}, capacity)
+      gc_cuckoo_map(gc, hash1_fn_type{}, hash2_fn_type{}, capacity)
     {}
 
     static const auto &descriptor() {
@@ -1042,6 +1091,11 @@ namespace mpgc {
         return *this;
       }
 
+      template <typename VT = value_type, typename = decltype(std::declval<const VT&>().lock())>
+      auto lock() const {
+        return _map->get(_key).lock();
+      }
+
       template <typename X, typename = decltype(std::declval<value_type&>() += std::declval<X>())>
       reference &operator +=(X&& arg) {
         _map->put(_key, updater([arg = std::forward<X>(arg)](value_type old) {
@@ -1174,17 +1228,17 @@ namespace mpgc {
 
   };
 
-  template <typename K, typename V, typename Hash1=ruts::hash1<K>, typename Hash2=ruts::hash2<K> >
-  using small_gc_cuckoo_map = gc_cuckoo_map<K,V,Hash1,Hash2,0>;
+  template <typename K, typename V, typename Traits=cuckoo_map_traits<K,V> >
+  using small_gc_cuckoo_map = gc_cuckoo_map<K,V,small_cuckoo_map_traits<Traits>>;
 
 
-  template <typename K, typename V, typename Hash1, typename Hash2, std::size_t SegBits>
-  constexpr typename gc_cuckoo_map<K,V,Hash1,Hash2,SegBits>::entry_ptr_type::template flag_id<0>
-  gc_cuckoo_map<K,V,Hash1,Hash2,SegBits>::moving;
+  template <typename K, typename V, typename Traits, std::size_t SegBits>
+  constexpr typename gc_cuckoo_map<K,V,Traits,SegBits>::entry_ptr_type::template flag_id<0>
+  gc_cuckoo_map<K,V,Traits,SegBits>::moving;
 
-  template <typename K, typename V, typename Hash1, typename Hash2, std::size_t SegBits>
-  constexpr typename gc_cuckoo_map<K,V,Hash1,Hash2,SegBits>::entry_ptr_type::template flag_id<1>
-  gc_cuckoo_map<K,V,Hash1,Hash2,SegBits>::frozen;
+  template <typename K, typename V, typename Traits, std::size_t SegBits>
+  constexpr typename gc_cuckoo_map<K,V,Traits,SegBits>::entry_ptr_type::template flag_id<1>
+  gc_cuckoo_map<K,V,Traits,SegBits>::frozen;
 
 
 }

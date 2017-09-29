@@ -43,7 +43,7 @@
 #include "mpgc/offset_ptr.h"
 #include "ruts/bit_field.h"
 #include "ruts/uniform_key.h"
-      
+#include "ruts/weak_key.h"      
 
 namespace mpgc {
   class gc_allocated;
@@ -52,13 +52,13 @@ namespace mpgc {
   template <typename T> class gc_array;
   template <typename T> class is_collectible;
   template <typename T, std::size_t NFlags = 0>
-  using versioned_gc_ptr = ruts::versioned<gc_ptr<T>, NFlags, base_offset_ptr::used_bits()>;
+  using versioned_gc_ptr = ruts::versioned<gc_ptr<T>, NFlags>;
   template <typename T, std::size_t NFlags = 0>
-  using atomic_versioned_gc_ptr = ruts::atomic_versioned<gc_ptr<T>, NFlags, base_offset_ptr::used_bits()>;
+  using atomic_versioned_gc_ptr = ruts::atomic_versioned<gc_ptr<T>, NFlags>;
   template <typename T, std::size_t NFlags = 0>
-  using versioned_weak_gc_ptr = ruts::versioned<weak_gc_ptr<T>, NFlags, base_offset_ptr::used_bits()>;
+  using versioned_weak_gc_ptr = ruts::versioned<weak_gc_ptr<T>, NFlags>;
   template <typename T, std::size_t NFlags = 0>
-  using atomic_versioned_weak_gc_ptr = ruts::atomic_versioned<weak_gc_ptr<T>, NFlags, base_offset_ptr::used_bits()>;
+  using atomic_versioned_weak_gc_ptr = ruts::atomic_versioned<weak_gc_ptr<T>, NFlags>;
 
   class gc_descriptor;
 
@@ -2179,7 +2179,6 @@ s   */
   template <typename T>
   struct gc_traits<weak_gc_ptr<T>> : is_ref_descriptor {};
 
-
   /**
    * A specialization of gc_traits for versioned_gc_ptr<T,NFlags>.
    *
@@ -2304,7 +2303,17 @@ s   */
   template <>
   struct gc_traits<ruts::with_uniform_id> : no_ref_descriptor<ruts::with_uniform_id> {};
 
-
+  template <typename WK, typename Traits>
+  struct gc_traits<ruts::weak_key<WK,Traits>> {
+    static const auto &descriptor() {
+      using this_type = ruts::weak_key<WK,Traits>;
+      static gc_descriptor d =
+	GC_DESC(this_type)
+	.template WITH_FIELD(&this_type::_stable_key)
+	.template WITH_FIELD(&this_type::_weak_key);
+      return d;
+    }
+  };
 
 };
 

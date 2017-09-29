@@ -63,24 +63,42 @@ namespace mpgc {
     }
 
     template <typename Fn, typename ...Args>
-    void process_stack(const std::size_t *start,
-                       const std::size_t *end,
-                       Fn&& func,
-                       Args&& ...args) {
-      constexpr auto ptr_type_fld = bits::field<special_ptr_type, std::size_t>(0, 2);
+    static void process_stack(in_memory_thread_struct &thread_struct,
+                              const std::size_t *start, const std::size_t *end, Fn&& func, Args&& ...args) {
+      gc_control_block &cb = control_block();
+      std::size_t last_ctrl = 0;
       while (start < end) {
+        bool is_valid_weak = false;
         if (base_offset_ptr::is_valid(reinterpret_cast<uint8_t*>(*start))) {
           std::forward<Fn>(func)(offset_ptr<const gc_allocated>(
             reinterpret_cast<const gc_allocated*>(*start)), std::forward<Args>(args)...);
         } else if (base_offset_ptr::could_be_offset_ptr(*start)) {
-          offset_ptr<gc_allocated> ptr(ptr_type_fld.replace(*start,
-                                                            special_ptr_type::Strong));
-          if (ptr.is_valid() && ptr->get_gc_descriptor().is_valid()) {
-            weak_gc_ptr<gc_allocated>::clear_sweep_allocated(ptr);
-            //func is supposed to filter out weak pointers. That's why we can't reuse ptr.
-            std::forward<Fn>(func)(offset_ptr<const gc_allocated>(*start),
-                                   std::forward<Args>(args)...);
+          offset_ptr<const gc_allocated> &ptr =
+            reinterpret_cast<offset_ptr<const gc_allocated>&>(
+                                               *const_cast<std::size_t*>(start));
+          offset_ptr<const gc_allocated> strong_ptr;
+          strong_ptr.remove_special_bits(ptr);
+          if (strong_ptr.is_valid() && strong_ptr->get_gc_descriptor().is_valid()) {
+            if (ptr.is_strong()) {
+              std::forward<Fn>(func)(ptr, std::forward<Args>(args)...);
+            } else if (ptr.is_contingent()) {
+              offset_ptr<const gc_allocated> ctrl_ptr(last_ctrl);
+              ctrl_ptr.remove_special_bits();
+              if (ctrl_ptr && strong_ptr) {
+                cb.ctrl_map.insert(ctrl_ptr, strong_ptr);
+              }
+            } else { // weak ptr
+              if (thread_struct.on_stack_wp_set.find(start) !=
+                  thread_struct.on_stack_wp_set.end()) {
+                is_valid_weak = true;
+              }
+            }
           }
+        }
+        if (is_valid_weak) {
+          last_ctrl = *start;
+        } else {
+          last_ctrl = 0;
         }
         start++;
       }
@@ -89,14 +107,6 @@ namespace mpgc {
     void process_stack_weak_ptrs(in_memory_thread_struct &thread_struct,
                                  std::size_t *start, std::size_t * const end) {
       gc_control_block &cb = control_block();
-      bool clear_signal = false;
-      /* We need to make signal clearing conditional as this function may be called while
-       * thread is inside lock/write_barrier.
-       */
-      if (thread_struct.weak_signal == Weak_signal::Working) {
-        thread_struct.weak_signal = Weak_signal::InBarrier;
-        clear_signal = true;
-      }
 
       for (auto it = thread_struct.on_stack_wp_set.begin();
            it != thread_struct.on_stack_wp_set.end();) {
@@ -111,14 +121,11 @@ namespace mpgc {
         if (base_offset_ptr::could_be_offset_ptr(*start) &&
             base_offset_ptr::is_weak(*start)) {
           offset_ptr<const gc_allocated> ptr(*start);
-          if (!weak_gc_ptr<const gc_allocated>::marked_or_sweep_allocated(cb, ptr)) {
+          if (!cb.bitmap.is_marked(ptr)) {
             thread_struct.on_stack_wp_set.insert(start);
           }
         }
         start++;
-      }
-      if (clear_signal) {
-        thread_struct.weak_signal = Weak_signal::Working;
       }
     }
 
@@ -158,7 +165,7 @@ namespace mpgc {
         thread_struct.status_idx = process_struct->get_gc_status();
       } else {
         assert(thread_struct.status_idx.load().index() == process_struct->global_list_index());
-        process_stack(reinterpret_cast<std::size_t*>(&stack_addr),
+        process_stack(thread_struct, reinterpret_cast<std::size_t*>(&stack_addr),
                       reinterpret_cast<std::size_t*>(thread_struct.stack_end),
                       mark_gray, thread_struct);
 
@@ -236,14 +243,14 @@ namespace mpgc {
         std::abort();
       }
 
-      if (ruts::env_flag("SUSPEND_ON_ABORT")) {
-        act.sa_sigaction = &hdl_abrt;
-        if (sigaction(SIGABRT, &act, NULL) < 0) {
-          std::abort();
-        }
-     //   if (sigaction(SIGSEGV, &act, NULL) < 0) {
-       //   std::abort();
-      //  }
+      act.sa_sigaction = &hdl_abrt;
+      if (ruts::env_flag("SUSPEND_ON_ABORT") &&
+          sigaction(SIGABRT, &act, NULL) < 0) {
+        std::abort();
+      }
+      if (ruts::env_flag("SUSPEND_ON_SEGFAULT") &&
+          sigaction(SIGSEGV, &act, NULL) < 0) {
+        std::abort();
       }
 
       if (thread_struct_list.head()) {

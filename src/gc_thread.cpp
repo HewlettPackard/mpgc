@@ -29,6 +29,7 @@
 
 #include "mpgc/gc_handshake.h"
 #include "mpgc/gc_thread.h"
+#include "mpgc/weak_ctrl_map.h"
 #include "mpgc/gc.h"
 
 namespace mpgc {
@@ -178,25 +179,6 @@ namespace mpgc {
     }
   }
 
-  void install_descriptor_epilogue(gc_descriptor &desc) {
-    constexpr auto stage_bits_fld = bits::field<Weak_stage, uint16_t>(0, 2);
-    //The following condition is needed to avoid failure during gc_control_block creation.
-    gc_control_block *cb = cblock;
-    if (!cb) {
-      return;
-    }
-    //gc_control_block &cb = control_block();
-    gc_handshake::in_memory_thread_struct &tstruct =
-                           *gc_handshake::thread_struct_handles.handle;
-
-    tstruct.weak_signal = gc_handshake::Weak_signal::InBarrier;
-    Weak_stage s = stage_bits_fld.decode(cb->weak_stage);
-    if (s == Weak_stage::Clean) {
-      desc.set_sweep_allocated();
-    }
-    tstruct.weak_signal = gc_handshake::Weak_signal::Working;
-  }
-
   void mark_bitmap::mark_gc_control_block() {
     //For this to work gc_control_block must be the first thing on the heap.
     _mark_end_first(0, (sizeof(gc_control_block) >> 3) - 1);
@@ -236,42 +218,83 @@ namespace mpgc {
    * The main function that marks black an object. It enumerates all
    * the pointers in the object and then marks it.
    */
-  static void mark_black(const offset_ptr<const gc_allocated> &p,
-                         gc_control_block &cb,
-                         Traversal_queue &q) {
-    //assert(p.is_valid() && p->get_gc_descriptor().is_valid());
-    //assert(p.is_valid());
+  static void mark_black(const offset_ptr<const gc_allocated> &p, gc_control_block &cb, Traversal_queue &q) {
     if (!p.is_valid() || cb.bitmap.is_marked(p) || !p->get_gc_descriptor().is_valid()) {
       return;
     }
-    //p->get_gc_descriptor().atomic_clear_sweep_allocated();
-    p->get_gc_descriptor().for_each_ref([&q, &cb](const base_offset_ptr *base_ptr) {
-      const offset_ptr<gc_allocated> ptr = *base_ptr;
+
+    offset_ptr<const gc_allocated> last_ctrl = nullptr;
+    bool last_ctrl_marked = false;
+    p->get_gc_descriptor().for_each_ref([&q, &cb, &last_ctrl, &last_ctrl_marked](const base_offset_ptr *base_ptr) {
+      offset_ptr<const gc_allocated> ptr = *base_ptr;
       if (!ptr.is_null()) {
         assert(ptr.is_valid());
         bool marked = cb.bitmap.is_marked(ptr);
         if (ptr.is_weak()) {
+          last_ctrl = ptr;
+          last_ctrl_marked = marked;
+          if (ptr.is_sweep_assigned()) {
+            const_cast<base_offset_ptr*>(base_ptr)->atomic_remove_sweep_assigned(ptr);
+          }
           if (!marked) {
             cb.bitmap.mark_weak((std::size_t*)base_ptr);
-            weak_gc_ptr<gc_allocated>
-            ::clear_sweep_allocated(ptr);
           }
-        } else if (!marked) {
+          /*
+           * Only needed for assertion.
+           */
+          ptr.remove_special_bits();
           assert(ptr->get_gc_descriptor().is_valid());
+          return; //Important to return here otherwise last_ctrl will get clear.
+        } else if (!marked) {
+          if (ptr.is_contingent()) {
+            ptr.remove_special_bits();
+            assert(last_ctrl == nullptr || ptr->get_gc_descriptor().is_valid());
+            if (last_ctrl == nullptr) {
+              return;
+            } else if (!last_ctrl_marked) {
+              last_ctrl.remove_special_bits();
+              //cb.bitmap.set_control_mark(last_ctrl);
+              if (cb.ctrl_map.insert(last_ctrl, ptr) &&
+                  !cb.bitmap.is_marked(last_ctrl)) {
+                last_ctrl = nullptr;
+                return;
+              } else {
+                assert(cb.bitmap.is_marked(last_ctrl));
+                //cb.bitmap.clear_control_mark(p);
+                //We don't process ctrl map entry as the thread which marked it will do so.
+              }
+            }
+          } else {
+            assert(ptr->get_gc_descriptor().is_valid());
+          }
           q.push(ptr);
         }
       }
+      last_ctrl = nullptr;
     });
     /*
      * We mark end-bitmap first so that in case we crash before marking begin-bitmap,
      * the object is not considered marked, and whichever process takes over the
      * unfinished work of this process, will mark it.
      */
-    cb.bitmap.mark_end_first(p);
-    // We should probably do this in the per-process struct and sweep
-    // the total into the global when we try to increment the cycle
-    // number, but that's more bookkeeping and it might be more work
-    // to get the reference to the per-process struct.
+    if (cb.bitmap.mark_end_first(p)) {
+    //if (cb.bitmap.is_control_marked(p)) {
+      cb.ctrl_map.process_and_remove(p, [&q, &cb](const offset_ptr<const gc_allocated> &p) {
+                                          if (!cb.bitmap.is_marked(p)) {
+                                            q.push(p);
+                                          }
+                                        });
+    }
+      //Control bit must be cleared after processing ctrl map entry.
+    //  cb.bitmap.clear_control_mark(p);
+   // }
+
+    /*
+     * We should probably do this in the per-process struct and sweep
+     * the total into the global when we try to increment the cycle
+     * number, but that's more bookkeeping and it might be more work
+     * to get the reference to the per-process struct.
+     */
     cb.mem_stats.marked(p);
   }
 
@@ -316,6 +339,7 @@ namespace mpgc {
   }
 
   static void consume_dead_process_refs(per_process_struct &process_struct, Traversal_queue &my_q) {
+    gc_control_block &cb = control_block();
     Traversal_queue &q = process_struct.traversal_queue();
     Mutator_persist_list &mb_list = process_struct.mutator_persist_list();
     Mpersist *m = mb_list.head();
@@ -328,6 +352,16 @@ namespace mpgc {
       m = mb_list.next(m);
     }
     my_q.push(process_struct.marking_ref());
+    if (cb.bitmap.is_marked(process_struct.marking_ref())) {//if we decide to us control bitmap, we can condition on that too
+      cb.ctrl_map.process_and_remove(process_struct.marking_ref(),
+                                     [&my_q, &cb](const offset_ptr<const gc_allocated> &p) {
+                                       if (!cb.bitmap.is_marked(p)) {
+                                         my_q.push(p);
+                                       }
+                                     });
+      //Control bit must be cleared after processing ctrl map entry.
+    //  cb.bitmap.clear_control_mark(p);
+    }
     my_q.takeover_locals(q);
   }
 
@@ -912,7 +946,6 @@ namespace mpgc {
                   "sizeof gc_allocated larger than size_t");
     const std::size_t * const end = begin + size;
 
-    // gc_control_block &cb = control_block();
     for (std::size_t s = 0; begin < end; begin += s) {
       const gc_descriptor &gc_desc
             = reinterpret_cast<gc_allocated*>(begin)->get_gc_descriptor();
@@ -1142,11 +1175,11 @@ namespace mpgc {
     });
   }
 
-  static void clear_sweep_allocated_inbound_weak_ptrs(gc_control_block &cb) {
+  static void clear_sweep_assigned_inbound_weak_ptrs(gc_control_block &cb) {
     inbound_pointers::inbound_weak_table::table(true)->for_each_slot([&cb](auto &wp) {
-      auto &p = wp.as_offset_pointer();
+      const offset_ptr<const gc_allocated> &p = wp.as_offset_pointer();
       if (p != nullptr) {
-        weak_gc_ptr<gc_allocated>::clear_sweep_allocated(p);
+        const_cast<offset_ptr<const gc_allocated>&>(p).atomic_remove_sweep_assigned(p);
       }
     });
   }
@@ -1156,11 +1189,10 @@ namespace mpgc {
        bits::field<std::size_t, std::size_t>(0, base_offset_ptr::used_bits());
     std::atomic<std::size_t> *atomic = reinterpret_cast<std::atomic<std::size_t>*>(p);
     std::size_t bare_exp = atomic->load();
-    //base_offset_ptr exp = bare_exp;
     offset_ptr<const gc_allocated> exp(bare_exp);
     assert(exp.is_null() || (exp.is_weak() && exp.is_valid()));
     while (!exp.is_null() &&
-           !weak_gc_ptr<const gc_allocated>::marked_or_sweep_allocated(cb, exp) &&
+           !weak_gc_ptr<const gc_allocated>::marked_or_sweep_assigned(cb, exp) &&
            !atomic->compare_exchange_weak(bare_exp, ptr_fld.replace(bare_exp, 0))) {
       exp = offset_ptr<const gc_allocated>(bare_exp);
       assert(exp.is_null() || (exp.is_weak() && exp.is_valid()));
@@ -1673,7 +1705,7 @@ namespace mpgc {
           if (request_gc_termination) {
             break;
           }
-          clear_sweep_allocated_inbound_weak_ptrs(cb);
+          clear_sweep_assigned_inbound_weak_ptrs(cb);
           //Main marking phase
           marking_phase(*gc_handshake::process_struct);
           if (request_gc_termination) {
@@ -1731,6 +1763,7 @@ namespace mpgc {
         if (request_gc_termination) {
           break;
         }
+        cb.ctrl_map.clear();
 
         cb.bitmap.sweep2_phase(local_status.status_idx.idx);
         if (request_gc_termination) {
