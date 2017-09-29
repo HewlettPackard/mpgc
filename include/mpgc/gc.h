@@ -50,6 +50,7 @@
 #include "mpgc/gc_cuckoo_map.h"
 #include "mpgc/weak_gc_ptr.h"
 #include "mpgc/contingent_gc_ptr.h"
+#include "mpgc/weak_ctrl_map.h"
 #include "mpgc/bump_allocation_slots.h"
 
 #include "ruts/collections.h"
@@ -336,6 +337,8 @@ namespace mpgc {
 
     gc_mem_stats mem_stats;
 
+    weak_ctrl_map ctrl_map;
+
     //Total number of processes at any time
     std::atomic<versioned_pcount_t> total_process_count;
 
@@ -355,6 +358,7 @@ namespace mpgc {
       bump_alloc_slots(after_cblock),
       bitmap(size),
       mem_stats(size, this),
+      ctrl_map(nullptr),
       total_process_count(versioned_pcount_t()),
       marking_barrier(marking_barrier_type(Barrier_stage::incrementing, Barrier_indices::marking1)),
       weak_stage(0),
@@ -375,6 +379,16 @@ namespace mpgc {
 
   extern gc_control_block &control_block();
   extern void init_on_createheap();
+
+  template<typename T>
+  inline
+  typename white_allocator<T>::pointer white_allocator<T>::allocate(const size_t n) {
+    static_assert(alignof(T) <= 8, "White allocation doesn't respect special alignment requests.");
+    gc_control_block &cb = control_block();
+    gc_status status = gc_handshake::process_struct->get_gc_status();
+    return static_cast<T*>(cb.global_free_lists[status.status_idx.idx]
+                               .allocate(cb, sizeof(T) * n));
+  }
 
   inline
   persistent_roots_t &persistent_roots() {
@@ -409,7 +423,7 @@ namespace ruts {
   template <>
   struct hash2<mpgc::persistent_root_key> {
     auto operator()(const mpgc::persistent_root_key &key) const {
-      return hash1<uniform_key>{}(key.id);
+      return hash2<uniform_key>{}(key.id);
     }
   };
 }

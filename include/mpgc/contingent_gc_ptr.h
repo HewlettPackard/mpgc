@@ -34,102 +34,204 @@
  * the default argument for the second template arg for
  * contingent_gc_ptr.
  */
+#include "ruts/atomic16B.h"
+#include "mpgc/gc_ptr.h"
 #include "mpgc/weak_gc_ptr.h"
 
 
 namespace mpgc {
-  /*
-   * As an initial dummy implementation, a contingent_gc_ptr will
-   * include a weak_gc_ptr (which is, itself, a dummy), and a gc_ptr.
-   */
+  template <typename T>
+  class controlled_gc_ptr {
+    offset_ptr<T> _ptr;
+    gc_ptr<T> convert_to_strong(const offset_ptr<T> &p) const {
+      constexpr auto ptr_type_fld = base_offset_ptr::ptr_type_fld;
+      return gc_ptr<T>::from_offset_ptr(offset_ptr<T>(ptr_type_fld.replace(p.val(), special_ptr_type::Strong)));
+    }
 
-  template <typename T, typename C>
-  class contingent_gc_ptr {
-    weak_gc_ptr<C> _control;
-    mutable gc_ptr<T> _ptr;
+    offset_ptr<T> convert_from_strong(const gc_ptr<T> &p) const {
+      if (p == nullptr) {
+        return nullptr;
+      }
+      constexpr auto ptr_type_fld = base_offset_ptr::ptr_type_fld;
+      return offset_ptr<T>(ptr_type_fld.replace(p.as_offset_pointer().val(), special_ptr_type::Contingent));
+    }
+   public:
+    controlled_gc_ptr() noexcept : _ptr(nullptr) {}
+    controlled_gc_ptr(std::nullptr_t) noexcept : controlled_gc_ptr{} {}
+    controlled_gc_ptr(const gc_ptr<T> &rhs) noexcept : _ptr(convert_from_strong(rhs)) {}
+
+    controlled_gc_ptr &operator =(std::nullptr_t) noexcept {
+      _ptr = nullptr;
+      return *this;
+    }
+    controlled_gc_ptr &operator =(const gc_ptr<T> &rhs) noexcept {
+      _ptr = convert_from_strong(rhs);
+      return *this;
+    }
+
+    operator gc_ptr<T>() const {
+      return convert_to_strong(_ptr);
+    }
+
+    const offset_ptr<T>& as_offset_pointer() const noexcept {
+      return _ptr;
+    }
+  };
+
+  template <typename C, typename T>
+  class alignas(16) contingent_gc_ptr {
+    struct pair {
+      weak_gc_ptr<C> _control;
+      controlled_gc_ptr<T> _ptr;
+
+      constexpr pair(weak_gc_ptr<C> c = nullptr, gc_ptr<T> p = nullptr) noexcept
+        : _control(c), _ptr(p) {}
+
+     /* pair(const pair& p) noexcept : _control(p._control), _ptr(p._ptr) {}
+      pair &operator =(const pair& p) noexcept {
+        _control = p._control;
+        _ptr = p._ptr;
+        return *this;
+      }*/
+
+      static const auto &descriptor() {
+        static gc_descriptor d =
+          GC_DESC(pair)
+          .template WITH_FIELD(&pair::_control)
+          .template WITH_FIELD(&pair::_ptr);
+        return d;
+      }
+    };
+
+    union {
+     ruts::atomic16B<pair> _atomic_pair;
+     pair                  _pair;
+    };
 
     template <typename X, typename Y>
-    using if_assignable = std::enable_if_t<std::is_assignable<T*&,X*>::value
-                                           && std::is_assignable<C*&,Y*>::value>;
+    using if_assignable = std::enable_if_t<std::is_assignable<C*&,X*>::value
+                                           && std::is_assignable<T*&,Y*>::value>;
   public:
     using control_type = C;
     using element_type = T;
 
+    static const auto &descriptor() {
+      static gc_descriptor d =
+        GC_DESC(contingent_gc_ptr)
+        .template WITH_FIELD(&contingent_gc_ptr::_pair);
+      return d;
+    }
+
+    /*
+     * The second (desired) argument is a non-const ref because if the
+     * controlling pointer in the pair is expired, cas() will null out
+     * the controlled pointer.
+     */
+    void cas(pair&, pair&, const bool);
+
+    template <typename X, typename Y, typename = if_assignable<X,Y> >
+    void cas(pair& old, const weak_gc_ptr<X>& new_wp, const gc_ptr<Y>& new_sp, const bool try_once) {
+      pair p(new_wp, new_sp);
+      return cas(old, p, try_once);
+    }
+
+    template <typename X, typename Y, typename = if_assignable<X,Y> >
+    void cas(contingent_gc_ptr &old, const weak_gc_ptr<X> &new_wp, const gc_ptr<Y> &new_sp, const bool try_once) {
+      pair p(new_wp, new_sp);
+      return cas(old._pair, p, try_once);
+    }
+
+    void write(pair &p) {
+      pair old = _atomic_pair;
+      cas(old, p, false);
+    }
+
+    template <typename X, typename Y, typename = if_assignable<X,Y> >
+    void write(const weak_gc_ptr<X> &new_wp, const gc_ptr<Y> &new_sp) {
+      write(pair(new_wp, new_sp));
+    }
+
+    void write(const contingent_gc_ptr &cp) {
+      pair p = cp._pair;
+      write(p);
+    }
+
+    template <typename X, typename = std::enable_if_t<std::is_assignable<C*&,X*>::value> >
+    void write_control(const weak_gc_ptr<X> &new_wp) {
+      pair old = _atomic_pair;
+      gc_ptr<C> sp = old._control.lock();
+      if (sp != nullptr) {
+        cas(old, pair(new_wp, old._ptr), false);
+      } else {
+        cas(old, pair(new_wp, nullptr), false);
+      }
+    }
+
+    template <typename Y, typename = std::enable_if_t<std::is_assignable<T*&,Y*>::value> >
+    void write_controlled(const gc_ptr<Y> &new_sp) {
+      pair old = _atomic_pair;
+      cas(old, old._control, new_sp, false);
+    }
+
     constexpr contingent_gc_ptr() noexcept
-      : _control{nullptr}, _ptr{nullptr}
+      : _pair{}
     {}
     constexpr contingent_gc_ptr(std::nullptr_t) noexcept
       : contingent_gc_ptr{}
     {}
 
-    contingent_gc_ptr(const contingent_gc_ptr &rhs) noexcept = default;
-    contingent_gc_ptr(contingent_gc_ptr &&rhs) noexcept = default;
-    contingent_gc_ptr &operator =(const contingent_gc_ptr &rhs) noexcept = default;
-    contingent_gc_ptr &operator =(contingent_gc_ptr &&rhs) noexcept = default;
+    contingent_gc_ptr(const contingent_gc_ptr &rhs) noexcept {
+      weak_gc_ptr<C>::write_barrier(this, &rhs._pair._control,
+                                    [&rhs]{return rhs._pair._control.as_offset_pointer();},
+                                    [this, &rhs](const offset_ptr<C>& wp) {
+                                      const_cast<offset_ptr<C> &>(_pair._control.as_offset_pointer()) = wp;
+                                      _pair._ptr = rhs._pair._ptr;
+                                    });
+    }
+
+    contingent_gc_ptr(contingent_gc_ptr&&rhs) noexcept
+      : contingent_gc_ptr(const_cast<const contingent_gc_ptr &>(rhs))
+      {}
+
+    contingent_gc_ptr(const weak_gc_ptr<C> &wp, const gc_ptr<T> &sp)
+    {
+      weak_gc_ptr<C>::write_barrier(this, &wp,
+                                    [&wp]{return wp.as_offset_pointer();},
+                                    [this, &sp](const offset_ptr<C>& wp) {
+                                      const_cast<offset_ptr<C> &>(_pair._control.as_offset_pointer()) = wp;
+                                      _pair._ptr = sp;
+                                    });
+    }
 
     template <typename X, typename Y, typename = if_assignable<X,Y> >
     contingent_gc_ptr(const contingent_gc_ptr<X,Y> &rhs) noexcept
-      : _control{rhs._control}, _ptr{rhs._ptr}
-    {}
-    template <typename X, typename Y, typename = if_assignable<X,Y> >
-    contingent_gc_ptr(contingent_gc_ptr<X,Y> &&rhs) noexcept
-      : _control{std::move(rhs._control)}, _ptr{std::move(rhs._ptr)}
-    {}
-    template <typename X, typename Y, typename = if_assignable<X,Y> >
-    contingent_gc_ptr(const gc_ptr<X> &p, const gc_ptr<Y> &c)
-      : _control{c}, _ptr{c == nullptr ? nullptr : p}
-    {}
-    template <typename X, typename Y, typename = if_assignable<X,Y> >
-    contingent_gc_ptr(const gc_ptr<X> &p, const weak_gc_ptr<Y> &c)
-      : _control{c}, _ptr{c}
-    {}
+    {
+      weak_gc_ptr<X>::write_barrier(this, &rhs._pair._control,
+                                    [&rhs]{return rhs._pair._control.as_offset_pointer();},
+                                    [this, &rhs](const offset_ptr<X>& wp) {
+                                      const_cast<offset_ptr<C> &>(_pair._control.as_offset_pointer()) = wp;
+                                      _pair._ptr = rhs._pair._ptr;
+                                    });
+    }
 
-    template <typename X, typename Y, typename = if_assignable<X,Y> >
-    explicit contingent_gc_ptr(std::pair<gc_ptr<X>, gc_ptr<Y>> &pair)
-      : contingent_gc_ptr{pair.first, pair.second}
-    {}
-    template <typename X, typename Y, typename = if_assignable<X,Y> >
-    explicit contingent_gc_ptr(std::pair<gc_ptr<X>, weak_gc_ptr<Y>> &pair)
-      : contingent_gc_ptr{pair.first, pair.second}
-    {}
-
-    /*
-     * And similarly for externals and rval refs, probably in all
-     * combinations.
-     */
-
-    contingent_gc_ptr &operator =(nullptr_t) noexcept {
-      /*
-       * Or should this leave the control alone (like other single
-       * pointer assignments) and only change the pointer?
-       */
-      _control = nullptr;
-      _ptr = nullptr;
+    contingent_gc_ptr &operator =(const contingent_gc_ptr &rhs) noexcept {
+      write(rhs);
       return *this;
     }
+    contingent_gc_ptr &operator =(contingent_gc_ptr &&rhs) noexcept {
+      write(rhs);
+      return *this;
+    }
+    contingent_gc_ptr &operator =(nullptr_t) noexcept {
+      write(contingent_gc_ptr());
+      return *this;
+    }
+
     template <typename X, typename Y, typename = if_assignable<X,Y> >
     contingent_gc_ptr &operator =(const contingent_gc_ptr<X,Y> &rhs) noexcept {
-      /*
-       * We will need to be careful about the atomicity of this (and
-       * the default).  It certainly has to work from a GC standpoint,
-       * but we also have to be careful about what happens if somebody
-       * calls get() while we're in the middle of an assignment.  For
-       * now, it's just a naive implementation.
-       */
-      _control = rhs._control;
-      _ptr = rhs._ptr;
+      write(rhs);
+      return *this;
     }
-    template <typename X, typename Y, typename = if_assignable<X,Y> >
-    contingent_gc_ptr &operator =(const std::pair<gc_ptr<X>, gc_ptr<Y>> &rhs) noexcept {
-      return (*this)=(contingent_gc_ptr{rhs});
-    }
-    template <typename X, typename Y, typename = if_assignable<X,Y> >
-    contingent_gc_ptr &operator =(const std::pair<gc_ptr<X>, weak_gc_ptr<Y>> &rhs) noexcept {
-      return (*this)=(contingent_gc_ptr{rhs});
-    }
-    /*
-     * And so on with externals.
-     */
 
     /*
      * The non-contingent assignments just change the pointer, leaving
@@ -138,98 +240,67 @@ namespace mpgc {
      */
     template <typename Y, typename = std::enable_if_t<std::is_assignable<T*&,Y*>::value> >
     contingent_gc_ptr &operator =(const gc_ptr<Y> &rhs) noexcept  {
-      _ptr = rhs;
-      return *this;
-    }
-
-    template <typename Y, typename = std::enable_if_t<std::is_assignable<T*&,Y*>::value> >
-    contingent_gc_ptr &operator =(gc_ptr<Y> &&rhs) noexcept {
-      _ptr = std::move(_ptr);
-      return *this;
-    }
-
-    template <typename Y, typename = std::enable_if_t<std::is_assignable<T*&,Y*>::value> >
-    contingent_gc_ptr &operator =(const external_gc_ptr<Y> &rhs) noexcept {
-      _ptr = rhs.value();
-      return *this;
-    }
-
-    template <typename Y, typename = std::enable_if_t<std::is_assignable<T*&,Y*>::value> >
-    contingent_gc_ptr &operator =(external_gc_ptr<Y> &&rhs) noexcept {
-      _ptr = std::move(rhs.value());
+      write_controlled(rhs);
       return *this;
     }
 
     void reset_control(nullptr_t) noexcept {
-      _control = nullptr;
-      _ptr = nullptr;
+      write_control(nullptr);
     }
-    template <typename Y, typename = std::enable_if_t<std::is_assignable<C*&,Y*>::value> >
-    void reset_control(const gc_ptr<Y> &rhs) noexcept {
-      _control = rhs;
+    void reset_control(const weak_gc_ptr<C> &rhs) noexcept {
+      write_control(rhs);
     }
-    template <typename Y, typename = std::enable_if_t<std::is_assignable<C*&,Y*>::value> >
-    void reset_control(const weak_gc_ptr<Y> &rhs) noexcept {
-      _control = rhs;
-    }
-    template <typename Y, typename = std::enable_if_t<std::is_assignable<C*&,Y*>::value> >
-    void reset_control(weak_gc_ptr<Y> &&rhs) noexcept {
-      _control = std::move(rhs);
-    }
-    /*
-     * etc.
-     */
 
-
-
-    std::pair<gc_ptr<T>, gc_ptr<C> > lock_pair() const noexcept {
-      /*
-       * We will need to think about the atomicity of this.
-       */
-      gc_ptr<C> locked_control = _control.lock();
-      if (locked_control == nullptr && _ptr != nullptr) {
-        _ptr = nullptr;
-      }
-      return std::make_pair(locked_control, _ptr);
+    std::pair<gc_ptr<C>, gc_ptr<T>> lock_pair() const noexcept {
+      pair p = _atomic_pair;
+      gc_ptr<C> ctrl = p._control.lock();
+      return std::make_pair(ctrl, (ctrl != nullptr) ? p._ptr : nullptr);
     }
 
     gc_ptr<T> lock() const noexcept {
-      gc_ptr<T> p = _ptr;
-      return p == nullptr ? nullptr : lock_pair().first;
+      std::pair<gc_ptr<C>, gc_ptr<T>> p = lock_pair();
+      return (p.first == nullptr || p.second == nullptr) ? nullptr : p.second;
     }
 
-    gc_ptr<T> operator->() const noexcept {
-      return lock();
-    }
+    // gc_ptr<T> operator->() const noexcept {
+    //   return lock();
+    // }
 
     weak_gc_ptr<C> control() const noexcept {
-      return _control;
+      return _pair._control;
     }
 
     gc_ptr<C> lock_control() const noexcept {
-      return _control.lock();
+      return _pair._control.lock();
     }
 
     bool control_expired() const noexcept {
-      return _control.expired();
+      return _pair._control.expired();
+    }
+
+    bool expired() const noexcept {
+      return control_expired();
     }
 
     void reset() noexcept {
-      _control.reset();
-      _ptr = nullptr;
+      write(nullptr, nullptr);
     }
-
+    
     void swap(contingent_gc_ptr &other) {
-      /* discuss atomicity */
-      _ptr.swap(other._ptr);
-      _control.swap(other._control);
+      pair p = _atomic_pair.load();
+      _atomic_pair = other._atomic_pair.load();
+      other._atomic_pair = p;
     }
 
     template <typename Ch, typename Tr>
     std::basic_ostream<Ch,Tr> &print_on(std::basic_ostream<Ch,Tr> &os) const {
-      return os << _ptr << "{" << _control << "}";
+      pair p = _atomic_pair;
+      return os << p._ptr << "{" << p._control << "}";
     }
   };
+
+  template <typename T>
+  struct gc_traits<controlled_gc_ptr<T>> : is_ref_descriptor {};
 }
 
 namespace std {
@@ -239,14 +310,17 @@ namespace std {
     lhs.swap(rhs);
   }
 
+  template <typename C, typename T, typename X>
+  basic_ostream<C,T> &
+  operator <<(basic_ostream<C,T> &os, const mpgc::controlled_gc_ptr<X> &ptr) {
+    return os << ptr.as_offset_pointer();
+  }
+
   template <typename C, typename T, typename X, typename Y>
   basic_ostream<C,T> &
   operator <<(basic_ostream<C,T> &os, const mpgc::contingent_gc_ptr<X,Y> &ptr) {
     return ptr.print_on(os);
   }
-
 }
-
-
 #endif
 

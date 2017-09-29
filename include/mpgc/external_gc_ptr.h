@@ -44,6 +44,7 @@
 #include <ostream>
 #include "mpgc/gc_ptr.h"
 #include "mpgc/weak_gc_ptr.h"
+#include "ruts/weak_key.h"
 
 namespace mpgc {
   extern void initialize();
@@ -388,7 +389,7 @@ namespace mpgc {
           bool used_created = false;
           slot *val;
           _current_block.update([&](current_ptr_t b) {
-              if (b != nullptr && b.version() <= block_size) {
+              if (b != nullptr && b.version() < block_size) {
                 /*
                  * There's still room.  Carve a slot off.
                  */
@@ -1120,12 +1121,14 @@ namespace mpgc {
 
     bool expired() const {
       if (_slot == nullptr) {
-        if (_slot->_ptr.expired()) {
-          iwt::drop_reference(_slot);
-          _slot == nullptr;
-        }
+        return true;
       }
-      return _slot == nullptr;
+      if (_slot->_ptr.expired()) {
+        iwt::drop_reference(_slot);
+        _slot = nullptr;
+        return true;
+      }
+      return false;
     }
     
     template <typename C, typename Tr>
@@ -1154,6 +1157,40 @@ namespace ruts {
     auto operator()(const mpgc::external_gc_ptr<T> &ptr) const {
       return ptr.hash2();
     }
+  };
+
+  template <typename T>
+  struct weak_key_traits<mpgc::external_weak_gc_ptr<T>>
+  {
+    using weak_type = mpgc::external_weak_gc_ptr<T>;
+    using strong_type = mpgc::external_gc_ptr<T>;
+    static weak_type convert(const strong_type &p) noexcept {
+      return p;
+    }
+    static strong_type lock(const weak_type &p) noexcept {
+      return p.lock();
+    }
+    static bool expired(const weak_type &p) noexcept {
+      return p.expired();
+    }
+    static bool equals(const weak_type &lhs, const weak_type &rhs) noexcept {
+      /*
+       * We don't want to lock unless we have to.
+       */
+      if (lhs.expired()) {
+        return rhs.expired();
+      }
+      if (rhs.expired()) {
+        return false;
+      }
+      return lock(lhs) == lock(rhs);
+    }
+    static auto extract_stable(const strong_type &ptr) {
+      return stable_key<T>()(*ptr);
+    }
+
+    using stable_key_type = std::decay_t<decltype(extract_stable(std::declval<strong_type>()))>;
+
   };
 
 }

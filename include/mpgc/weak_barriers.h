@@ -31,43 +31,119 @@
 
 namespace mpgc {
   template <typename T>
-  bool weak_gc_ptr<T>::marked_or_sweep_allocated(gc_control_block &cb,
-                                                 const offset_ptr<T> &p) {
+  bool weak_gc_ptr<T>::marked_or_sweep_assigned(gc_control_block &cb,
+                                                const offset_ptr<T> p) noexcept {
     static_assert(std::is_base_of<gc_allocated, T>::value,
                   "T is not derived from gc_allocated");
-    constexpr auto ptr_type_fld = bits::field<special_ptr_type, std::size_t>(0, 2);
-    if (!cb.bitmap.is_marked(p)) {
-      const offset_ptr<T> ptr(ptr_type_fld.replace(p.val(),
-                                                   special_ptr_type::Strong));
-      if (!ptr->get_gc_descriptor().was_allocated_during_sweep()) {
-        return false;
-      }
-    }
-    return true;
+    return cb.bitmap.is_marked(p) || p.is_sweep_assigned();
   }
 
-  template <typename T>
-  void weak_gc_ptr<T>::clear_sweep_allocated(const offset_ptr<T> &p) {
-    static_assert(std::is_base_of<gc_allocated, T>::value,
-                  "T is not derived from gc_allocated");
-    constexpr auto ptr_type_fld = bits::field<special_ptr_type, std::size_t>(0, 2);
-    const offset_ptr<T> ptr(ptr_type_fld.replace(p.val(),
-                                                 special_ptr_type::Strong));
-    std::const_pointer_cast<std::remove_const_t<T>>(ptr)->
-                     get_non_const_gc_desc().atomic_clear_sweep_allocated();
+  //NOTE: Look for comment in write_barrier for handling of sweep-assigned weak ptrs on stack.
+
+  template<typename C, typename T>
+  void contingent_gc_ptr<C, T>::cas(pair &old, pair &des, const bool try_once) {
+    constexpr auto stage_bits_fld = bits::field<Weak_stage, uint16_t>(0, 2);
+    assert(!base_offset_ptr::is_valid(&old));
+    gc_handshake::in_memory_thread_struct &thread_struct =
+                                 *gc_handshake::thread_struct_handles.handle;
+    gc_control_block &cb = control_block();
+    //old must be on stack.
+    assert(!base_offset_ptr::is_valid(&old));
+    thread_struct.sweep_signal_disabled = true;
+    auto it = thread_struct.on_stack_wp_set.find(&des._control);
+    if (it != thread_struct.on_stack_wp_set.end()) {
+      constexpr auto ptr_fld =
+         bits::field<std::size_t, std::size_t>(0, base_offset_ptr::used_bits());
+      size_t *p = reinterpret_cast<size_t*>(const_cast<weak_gc_ptr<C>*>(&des._control));
+      *p = ptr_fld.replace(*p, 0);
+
+      p = reinterpret_cast<size_t*>(
+                      const_cast<offset_ptr<T>*>(&des._ptr.as_offset_pointer()));
+      *p = ptr_fld.replace(*p, 0);
+      thread_struct.on_stack_wp_set.erase(it);
+    }
+    thread_struct.on_stack_wp_set.erase(&_pair._control);
+    thread_struct.on_stack_wp_set.erase(&old._control);
+    /*
+     * It is important to start weak barrier *before* enabling sweep signal.
+     * Otherwise, the same rhs, which was not needed to be erased earlier,
+     * may now become eligible, but this time nobody will clear it and it
+     * will erroneously get assigned to lhs.
+     */
+    thread_struct.weak_signal = gc_handshake::Weak_signal::InBarrier;
+    do {
+      Weak_stage s = stage_bits_fld.decode(cb.weak_stage);
+      switch (s) {
+        case Weak_stage::Normal:
+          break;
+        case Weak_stage::Trace:
+        case Weak_stage::Repeat:
+          {
+            gc_handshake::Signum sig = thread_struct.status_idx.load().status();
+            offset_ptr<T> control = old._control.as_offset_pointer();
+            offset_ptr<T> ptr = old._ptr.as_offset_pointer();
+            if (sig == gc_handshake::Signum::sigAsync && control && ptr) {
+              control.remove_special_bits();
+              ptr.remove_special_bits();
+              if (cb.bitmap.is_marked(control)) {
+                thread_struct.persist_data->mbuf.add_element(ptr);
+              } else {
+                cb.ctrl_map.insert(control, ptr);
+                if (cb.bitmap.is_marked(control)) {
+                  thread_struct.persist_data->mbuf.add_element(ptr);
+                }
+              }
+            }
+            const_cast<offset_ptr<C>&>(des._control.as_offset_pointer()).remove_sweep_assigned();
+          }
+          /*
+           * Fallthrough
+           */
+        case Weak_stage::Clean:
+          if (!cb.bitmap.is_marked(des._control.as_offset_pointer())) {
+            if (s == Weak_stage::Clean) {
+              gc_handshake::Signum sig = thread_struct.status_idx.load().status();
+              if (sig == gc_handshake::Signum::sigAsync ||
+                  !des._control.as_offset_pointer().is_sweep_assigned()) {
+                const_cast<offset_ptr<C>&>(des._control.as_offset_pointer()) = nullptr;
+                des._ptr = nullptr;
+              }
+            } else if (base_offset_ptr::is_valid(&_pair)) {
+              cb.bitmap.mark_weak(reinterpret_cast<std::size_t*>(&_pair._control));
+            }
+          }
+      }
+    } while (!_atomic_pair.compare_exchange_strong(old, des) && !try_once);
+    thread_struct.weak_signal = gc_handshake::Weak_signal::Working;
+    thread_struct.sweep_signal_disabled = false;
+    if (thread_struct.sweep_signal_requested) {
+      thread_struct.sweep_signal_requested = false;
+      gc_handshake::do_deferred_sweep_signal(thread_struct);
+    }
   }
 
   template <typename T> template <typename Fn>
-  void weak_gc_ptr<T>::write_barrier(Fn &&func) {
+  void weak_gc_ptr<T>::write_barrier(const offset_ptr<T> &p, Fn &&func) noexcept {
+    constexpr auto stage_bits_fld = bits::field<Weak_stage, uint16_t>(0, 2);
     gc_handshake::in_memory_thread_struct &tstruct =
                            *gc_handshake::thread_struct_handles.handle;
+    gc_control_block &cb = control_block();
 
     tstruct.weak_signal = gc_handshake::Weak_signal::InBarrier;
     tstruct.sweep_signal_disabled = true;
 
     tstruct.on_stack_wp_set.erase(this);
-    std::forward<Fn>(func)();
-
+    offset_ptr<T> r = nullptr;
+    if (p != nullptr) {
+      Weak_stage s = stage_bits_fld.decode(cb.weak_stage);
+      if (s == Weak_stage::Clean && !cb.bitmap.is_marked(p)) {
+        r.set_sweep_assigned(p);
+      } else {
+        r.set_weak_assigned(p);
+      }
+    }
+    std::forward<Fn>(func)(r);
+ 
     tstruct.sweep_signal_disabled = false;
     if (tstruct.sweep_signal_requested) {
       tstruct.sweep_signal_requested = false;
@@ -84,7 +160,6 @@ namespace mpgc {
     static_assert(std::is_base_of<gc_allocated, T>::value,
                   "T is not derived from gc_allocated");
     constexpr auto stage_bits_fld = bits::field<Weak_stage, uint16_t>(0, 2);
-    constexpr auto ptr_type_fld = bits::field<special_ptr_type, std::size_t>(0, 2);
 
     gc_handshake::in_memory_thread_struct &thread_struct =
                                  *gc_handshake::thread_struct_handles.handle;
@@ -100,56 +175,100 @@ namespace mpgc {
       thread_struct.on_stack_wp_set.erase(it);
     }
     thread_struct.on_stack_wp_set.erase(lhs);
+
+    /*
+     * It is important to start weak barrier *before* enabling sweep signal.
+     * Otherwise, the same rhs, which was not needed to be erased earlier,
+     * may now become eligible, but this time nobody will clear it and it
+     * will erroneously get assigned to lhs.
+     */
+    thread_struct.weak_signal = gc_handshake::Weak_signal::InBarrier;
+
+    /*
+     * Handling of sweep-assigned weak pointers on stack:
+     * It is essential for correctness that a sweep-assigned
+     * weak pointer from ith iteration is not mistakenly considered
+     * as live in (i+1)th iteration, if the object that it points to
+     * has been collected in (i+1)th iteration. However, that may happen
+     * if such a ptr is on stack because we cannot clear weak ptrs on
+     * stack.
+     * We solve this by first ensuring that the entire barrier is executed
+     * with sweep handshake deferred. Then during Normal, Trace, and Repeat
+     * the functioning is same as before. We basically do nothing during
+     * Normal, while in other two cases, we ensure the sweep-assigned bit
+     * is not propogated forward. The GC thread, while enumerating pointers
+     * remove the sweep-assigned bit from every weak-ptr, except from stacks.
+     *
+     * During Clean, the handling is more sophisticated. We rely on the fact
+     * that sweep handshake is deferred. Therefore, if the ptr is not marked,
+     * and the sweep handshake hasn't happened yet, then even if the sweep-
+     * assigned bit is set, we can guarantee that the pointer must be cleared.
+     */
+    offset_ptr<T> r = std::forward<LoadFn>(load_func)();
+    if (r != nullptr) {
+      Weak_stage s = stage_bits_fld.decode(cb.weak_stage);
+      switch (s) {
+        case Weak_stage::Normal:
+          break;
+        case Weak_stage::Trace:
+        case Weak_stage::Repeat:
+          r.remove_sweep_assigned();
+          if (!base_offset_ptr::is_valid(lhs)) {
+            break;
+          }
+        case Weak_stage::Clean:
+          if (!cb.bitmap.is_marked(r)) {
+            if (s == Weak_stage::Clean) {
+              gc_handshake::Signum sig = thread_struct.status_idx.load().status();
+              if (sig == gc_handshake::Signum::sigAsync || !r.is_sweep_assigned()) {
+                r = nullptr;
+              }
+            } else {
+              cb.bitmap.mark_weak((std::size_t*)lhs);
+            }
+          }
+      }
+    }
+    std::forward<ModFn>(mod_func)(r);
+    thread_struct.weak_signal = gc_handshake::Weak_signal::Working;
+    /*
+     * It is essential to defer sweep handshake for entire duration
+     * of a write barrier for correct handling of sweep-assigned weak
+     * pointers that are on stack.
+     */
     thread_struct.sweep_signal_disabled = false;
     if (thread_struct.sweep_signal_requested) {
       thread_struct.sweep_signal_requested = false;
       gc_handshake::do_deferred_sweep_signal(thread_struct);
     }
-
-    thread_struct.weak_signal = gc_handshake::Weak_signal::InBarrier;
-    offset_ptr<T> r = std::forward<LoadFn>(load_func)();
-    Weak_stage s = stage_bits_fld.decode(cb.weak_stage);
-    switch (s) {
-      case Weak_stage::Normal:
-        break;
-      case Weak_stage::Trace:
-      case Weak_stage::Repeat:
-        if (!base_offset_ptr::is_valid(lhs)) {
-          break;
-        }
-        clear_sweep_allocated(r);
-      case Weak_stage::Clean:
-        if (!cb.bitmap.is_marked(r, true)) {
-          if (s == Weak_stage::Clean) {
-            offset_ptr<T> ptr(ptr_type_fld.replace(r.val(),
-                                                   special_ptr_type::Strong));
-            if (!ptr->get_gc_descriptor().was_allocated_during_sweep()) {
-              r = nullptr;
-            }
-          } else {
-            cb.bitmap.mark_weak((std::size_t*)lhs);
-          }
-        }
-    }
-    std::forward<ModFn>(mod_func)(r);
-    thread_struct.weak_signal = gc_handshake::Weak_signal::Working;
   }
 
   template<typename T>
-  gc_ptr<T> weak_gc_ptr<T>::lock() const noexcept {
+  bool weak_gc_ptr<T>::expired() const noexcept{
     static_assert(std::is_base_of<gc_allocated, T>::value,
                   "T is not derived from gc_allocated");
     gc_handshake::in_memory_thread_struct &thread_struct =
                            *gc_handshake::thread_struct_handles.handle;
     gc_control_block &cb = control_block();
-    per_process_struct &proc = *gc_handshake::process_struct;
 
-    //constexpr auto version_bits_fld = bits::field<uint16_t, uint16_t>(2, 14);
+    //Following struct ensures that the weak barrier is handled properly.
+    struct weak_barrier_handle {
+      gc_handshake::in_memory_thread_struct &tstruct;
+      weak_barrier_handle(gc_handshake::in_memory_thread_struct &t) : tstruct(t) {
+        tstruct.weak_signal = gc_handshake::Weak_signal::InBarrier;
+      }
+
+      ~weak_barrier_handle() {
+        tstruct.weak_signal = gc_handshake::Weak_signal::Working;
+
+        tstruct.sweep_signal_disabled = false;
+        if (tstruct.sweep_signal_requested) {
+          tstruct.sweep_signal_requested = false;
+          gc_handshake::do_deferred_sweep_signal(tstruct);
+        }
+      }
+    };
     constexpr auto stage_bits_fld = bits::field<Weak_stage, uint16_t>(0, 2);
-    constexpr auto state_bits_fld = bits::field<gc_mutator_weak_sync_state, uint16_t>(0, 1);
-    constexpr auto nr_thread_bits_fld = bits::field<uint16_t, uint16_t>(1, 15);
-    constexpr auto ptr_type_fld = bits::field<special_ptr_type, std::size_t>(0, 2);
-
     bool done = false;
 
     thread_struct.sweep_signal_disabled = true;
@@ -163,52 +282,129 @@ namespace mpgc {
       done = true;
     }
 
-    thread_struct.sweep_signal_disabled = false;
-    if (thread_struct.sweep_signal_requested) {
-      thread_struct.sweep_signal_requested = false;
-      gc_handshake::do_deferred_sweep_signal(thread_struct);
+    /*
+     * It is important to start weak barrier *before* enabling sweep signal.
+     * Otherwise, the same rhs, which was not needed to be erased earlier,
+     * may now become eligible, but this time nobody will clear it and it
+     * will erroneously get assigned to lhs.
+     */
+    weak_barrier_handle barrier_handle(thread_struct);
+
+    if (done) {
+      return true;
     }
+
+    Weak_stage s = stage_bits_fld.decode(cb.weak_stage);
+    if (s == Weak_stage::Clean) {
+      gc_handshake::Signum sig = thread_struct.status_idx.load().status();
+      offset_ptr<T> ptr = _ptr;
+      //Check the comment in write_barrier above to know how sweep-assigned weak
+      //ptr on stack are handled.
+      return ptr == nullptr ||
+             (!cb.bitmap.is_marked(ptr) &&
+              (sig == gc_handshake::Signum::sigAsync ||
+               !ptr.is_sweep_assigned()));
+    } else {
+      return _ptr == nullptr;
+    }
+  }
+
+  template<typename T>
+  gc_ptr<T> weak_gc_ptr<T>::lock() const noexcept {
+    static_assert(std::is_base_of<gc_allocated, T>::value,
+                  "T is not derived from gc_allocated");
+    gc_handshake::in_memory_thread_struct &thread_struct =
+                           *gc_handshake::thread_struct_handles.handle;
+    gc_control_block &cb = control_block();
+    per_process_struct &proc = *gc_handshake::process_struct;
+
+    //constexpr auto version_bits_fld = bits::field<uint16_t, uint16_t>(2, 14);
+    //Following struct ensures that the weak barrier is handled properly.
+    struct weak_barrier_handle {
+      gc_handshake::in_memory_thread_struct &tstruct;
+      weak_barrier_handle(gc_handshake::in_memory_thread_struct &t) : tstruct(t) {
+        tstruct.weak_signal = gc_handshake::Weak_signal::InBarrier;
+      }
+
+      ~weak_barrier_handle() {
+        tstruct.weak_signal = gc_handshake::Weak_signal::Working;
+        tstruct.sweep_signal_disabled = false;
+        if (tstruct.sweep_signal_requested) {
+          tstruct.sweep_signal_requested = false;
+          gc_handshake::do_deferred_sweep_signal(tstruct);
+        }
+      }
+    };
+    constexpr auto stage_bits_fld = bits::field<Weak_stage, uint16_t>(0, 2);
+    constexpr auto state_bits_fld = bits::field<gc_mutator_weak_sync_state, uint16_t>(0, 1);
+    constexpr auto nr_thread_bits_fld = bits::field<uint16_t, uint16_t>(1, 15);
+    bool done = false;
+
+    thread_struct.sweep_signal_disabled = true;
+    auto it = thread_struct.on_stack_wp_set.find(&_ptr);
+    if (it != thread_struct.on_stack_wp_set.end()) {
+      constexpr auto ptr_fld =
+         bits::field<std::size_t, std::size_t>(0, base_offset_ptr::used_bits());
+      size_t *p = reinterpret_cast<size_t*>(const_cast<offset_ptr<T>*>(&_ptr));
+      *p = ptr_fld.replace(*p, 0);
+      thread_struct.on_stack_wp_set.erase(it);
+      done = true;
+    }
+
+    /*
+     * It is important to start weak barrier *before* enabling sweep signal.
+     * Otherwise, the same rhs, which was not needed to be erased earlier,
+     * may now become eligible, but this time nobody will clear it and it
+     * will erroneously get assigned to lhs.
+     */
+    weak_barrier_handle barrier_handle(thread_struct);
+
     if (done) {
       return nullptr;
     }
 
-    offset_ptr<T> r(ptr_type_fld.replace(_ptr.val(), special_ptr_type::Strong));
-    if (!r.is_valid()) {
-      return gc_ptr<T>::from_offset_ptr(r);
+    offset_ptr<T> r = _ptr;
+    if (r == nullptr) {
+      return nullptr;
     }
     /* The following signal fence is required to ensure that the read of offset_ptr
      * above takes place before read of signal below in the if condition, as we
      * might get a signal in between.
      */
-    std::atomic_signal_fence(std::memory_order_release);
+    std::atomic_signal_fence(std::memory_order_acquire);
 
     gc_handshake::Signum sig = thread_struct.status_idx.load().status();
     if (sig == gc_handshake::Signum::sigSync1 || sig == gc_handshake::Signum::sigSync2) {
+      r.remove_special_bits();
       return gc_ptr<T>::from_offset_ptr(r);
     }
 
     do {
-      thread_struct.weak_signal = gc_handshake::Weak_signal::InBarrier;
-      r.set_val(ptr_type_fld.replace(_ptr.val(), special_ptr_type::Strong));
-      if (!r.is_valid()) {
-        break;
-      }
       uint16_t expected_stage = cb.weak_stage;
       Weak_stage s = stage_bits_fld.decode(expected_stage);
       if (s == Weak_stage::Normal || thread_struct.bitmap->is_marked(r)) {
-        done = true;
+        r.remove_special_bits();
+        return gc_ptr<T>::from_offset_ptr(r);
       } else {
         switch (s) {
           case Weak_stage::Clean:
-            if (!r->get_gc_descriptor().was_allocated_during_sweep()) {
-              r = nullptr;
+            /* We don't need to read signal again because if we looped over while loop,
+             * then there is no way that we could have gone past sweep handshake as it
+             * is disabled. And if we are not ever in Async, then we will not loop over.
+             */
+            if (sig == gc_handshake::Signum::sigAsync || !r.is_sweep_assigned()) {
+              return nullptr;
             }
+          /*
+           * Fallthrough
+           */
           case Weak_stage::Normal:
-            done = true;
-            break;
+            r.remove_special_bits();
+            return gc_ptr<T>::from_offset_ptr(r);
           case Weak_stage::Trace:
             {//First try to acquire process-local lock.
               uint16_t expected = proc.gc_mutator_weak_sync;
+              r.remove_special_bits();
               while (state_bits_fld.decode(expected) == gc_mutator_weak_sync_state::Work) {
                 if (proc.gc_mutator_weak_sync.
                          compare_exchange_weak(expected,
@@ -228,24 +424,35 @@ namespace mpgc {
                 }
               }
             }
+            if (done) {
+              break;
+            }
             /*
              * Couldn't do the marking through process-local mechanism above. Lets try the
              * global weak stage now.
              */
-            if (done || !cb.weak_stage.
-                            compare_exchange_strong(expected_stage,
-                                                    stage_bits_fld.
-                                                    replace(expected_stage,
-                                                            Weak_stage::Repeat))) {
+            if (!cb.weak_stage.compare_exchange_strong(expected_stage,
+                                                       stage_bits_fld.
+                                                       replace(expected_stage,
+                                                               Weak_stage::Repeat))) {
+              thread_struct.weak_signal = gc_handshake::Weak_signal::InBarrier;
+              //No fence needed here as weak_signal is an atomic variable.
+              r = _ptr;
+              if (r == nullptr) {
+                return nullptr;
+              }
               break;
             }
+          /*
+           * Fallthrough
+           */
           case Weak_stage::Repeat:
+            r.remove_special_bits();
             thread_struct.persist_data->mbuf.add_element(r);
             done = true;
         }
       }
     } while (!done);
-    thread_struct.weak_signal = gc_handshake::Weak_signal::Working;
     assert(r.is_null() || r->get_gc_descriptor().is_valid());
     return gc_ptr<T>::from_offset_ptr(r);
   }

@@ -195,8 +195,8 @@ namespace ruts {
       using slot_array_type = ruts::runtime_array<atomic_entry_ptr_type, atomic_entry_ptr_alloc_type>;
 
       const std::size_t _num;
-      table &_table;
-      switched_hash _hash = _table._hash;
+      pointer<table> _table;
+      switched_hash _hash = _table->_hash;
       const std::size_t _slot_bits;
       const std::size_t _size = (std::size_t{1} << _slot_bits);
       const std::size_t _mask = _size-1;
@@ -303,7 +303,7 @@ namespace ruts {
 	    return true;
 	  }
 	  return (ptr->key == current->key 
-		  && _table._side == side::RIGHT);
+		  && _table->_side == side::RIGHT);
         };
 
         auto change = [=](entry_ptr_type ep) {
@@ -335,12 +335,12 @@ namespace ruts {
         // now, we're going to punt, which may result in more work being done than
         // strictly necessary.
         if (sp[frozen]) {
-          _table._map.clear_slot(target, ur.resulting_value(), current->key);
+          _table->_map->clear_slot(target, ur.resulting_value(), current->key);
           throw source_grew{};
         }
         if (sp.pointer() != current) {
           // It was removed, so we need to clear the slot.
-          _table._map.clear_slot(target, ur.resulting_value(), current->key);
+          _table->_map->clear_slot(target, ur.resulting_value(), current->key);
           return false;
         }
         // Now we remove the "moving" flag.
@@ -363,16 +363,16 @@ namespace ruts {
         }
         // We're done moving.  The value is now in both places.
         // Remove it from the source.  If it's not there, it means it was removed.  That's okay.
-        _table._map.clear_slot(source, current, current->key);
+        _table->_map->clear_slot(source, current, current->key);
         return true;
       }
 
 
       void grow(std::size_t by) {
-        pointer<segment> new_seg = _table.create_segment(this, by);
+        pointer<segment> new_seg = _table->create_segment(this, by);
         if (!ruts::try_change_value(_replacement, nullptr, new_seg)) {
           // Somebody else got there first.  That's okay.
-          _table.delete_segment(new_seg);
+          _table->delete_segment(new_seg);
         }
         help_with_grow();
         // At the end it will be installed.
@@ -416,7 +416,7 @@ namespace ruts {
         }
         // Now everything has been moved.  We might be the first to have finished (or the
         // one who was might have died before installing), so we'll try to install.
-        cas_loop_return_value<pointer<segment>> install_res = try_change_value(_table._segments[_num], nc_this, r);
+        cas_loop_return_value<pointer<segment>> install_res = try_change_value(_table->_segments[_num], nc_this, r);
         // If that failed, somebody else got there first... and we might even have grown
         // again.  But that's okay.  We've completed this grow.
         // Even if it succeeded, we can't delete the old one yet, because others are using it.
@@ -427,7 +427,8 @@ namespace ruts {
       }
 
     public:
-      explicit segment(std::size_t n, std::size_t slot_bits, atomic_entry_ptr_alloc_type alloc, table &t)
+      explicit segment(std::size_t n, std::size_t slot_bits, atomic_entry_ptr_alloc_type alloc,
+                       const pointer<table> &t)
       : _num(n),
         _table(t),
         _slot_bits(slot_bits),
@@ -527,11 +528,11 @@ namespace ruts {
     class table {
       static const std::size_t n_segments = 1 << n_seg_bits;
 
-      cuckoo_map &_map;
+      pointer<cuckoo_map> _map;
       const side _side;
       const switched_hash _hash;
       std::array<std::atomic<pointer<segment>>, n_segments> _segments;
-      table &_other_side = _map.other_table(_side);
+      pointer<table> _other_side = _map->other_table(_side);
       mutable segment_alloc_type _seg_alloc;
 
       const segment &find_segment(hash_type hash) const {
@@ -561,17 +562,17 @@ namespace ruts {
         _seg_alloc.deallocate(s, 1);
       }
 
-      explicit table(cuckoo_map &m, side s, const hash1_fn_type &hash1, const hash2_fn_type hash2, std::size_t seg_slot_bits, Allocator a) :
+      explicit table(const pointer<cuckoo_map> &m, side s, const hash1_fn_type &hash1, const hash2_fn_type hash2, std::size_t seg_slot_bits, Allocator a) :
       _map(m), _side(s), _hash(s, hash1, hash2), _seg_alloc(segment_alloc_type{a})
       {
         int n = 0;
         for (auto &p : _segments) {
-          p = create_segment(n++, seg_slot_bits, atomic_entry_ptr_alloc_type{a}, *this);
+          p = create_segment(n++, seg_slot_bits, atomic_entry_ptr_alloc_type{a}, this);
         }
 
       }
 
-      table &other_side() const {
+      const pointer<table> &other_side() const {
         return _other_side;
       }
 
@@ -600,16 +601,18 @@ namespace ruts {
 
     };
 
+    static_assert(alignof(table) <= 8, "Not aligned right");
+
     table _left_table;
     table _right_table;
     mutable entry_alloc_type _entry_alloc;
 
-    table &table_on(side s) {
-      return s == side::LEFT ? _left_table : _right_table;
+    pointer<table> table_on(side s) {
+      return s == side::LEFT ? &_left_table : &_right_table;
     }
 
-    table &other_table(side s) {
-      return s == side::RIGHT ? _left_table : _right_table;
+    pointer<table> other_table(side s) {
+      return s == side::RIGHT ? &_left_table : &_right_table;
     }
 
     pointer<entry_type> find(const key_type &key) const {
@@ -712,7 +715,7 @@ namespace ruts {
         }
         slot.seg->growth_candidate(key, e->key, best, resulting_size, growth);
         key = e->key;
-        t = &t->other_side();
+        t = t->other_side();
       }
 
     }
@@ -845,8 +848,8 @@ namespace ruts {
 
   public:
     cuckoo_map(const hash1_fn_type &h1, const hash2_fn_type &h2, std::size_t capacity = default_cap, Allocator alloc = Allocator{}) :
-      _left_table(*this, side::LEFT, h1, h2, slot_bits_for(capacity), alloc),
-      _right_table(*this, side::RIGHT, h1, h2, slot_bits_for(capacity), alloc),
+      _left_table(this, side::LEFT, h1, h2, slot_bits_for(capacity), alloc),
+      _right_table(this, side::RIGHT, h1, h2, slot_bits_for(capacity), alloc),
       _entry_alloc(alloc)
       {}
 

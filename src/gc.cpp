@@ -42,6 +42,9 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <iomanip>
+#include <fstream>
+#include <chrono>
 
 #include "ruts/managed.h"
 #include "mpgc/gc.h"
@@ -162,4 +165,27 @@ namespace mpgc {
   std::size_t gc_mem_stats::n_processes() const {
     return cblk->total_process_count.load().count;
   }
+
+  void
+  trace_mem_activity::print(const void *ptr, const std::string &msg) {
+    using namespace std;
+    using namespace std::chrono;
+    const gc_allocated *p = reinterpret_cast<const gc_allocated *>(ptr);
+    const gc_descriptor &d = p->get_gc_descriptor();
+    std::size_t s = d.object_size();
+    offset_ptr<const gc_allocated> op = p;
+    static mutex m;
+    lock_guard<mutex> lock{m};
+    static ofstream out("gc-trace."+ruts::to_string(getpid()));
+    ruts::reset_flags_on_exit rf(out);
+    auto now = system_clock::now();
+    out << op
+        << dec
+      //        << " [" << setw(9) << counter++ << "]"
+        << " [" << setw(9) << now.time_since_epoch().count() << "]"
+        << "  " << setw(4) << s
+        << " " << msg
+        << endl;
+  }
+
 }

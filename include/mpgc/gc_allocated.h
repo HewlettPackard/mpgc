@@ -33,11 +33,14 @@
 #include "mpgc/gc_fwd.h"
 #include "mpgc/gc_desc.h"
 
+#define TRACE_ALLOCATIONS
+#define TRACE_COLLECTIONS
+#define TRACE_MARKING
+
 namespace mpgc {
   namespace gc_handshake {
     struct in_memory_thread_struct;
   }
-  extern void install_descriptor_epilogue(gc_descriptor&);
 
   namespace gc_allocator {
     class bump_allocation_slots;
@@ -81,7 +84,6 @@ namespace mpgc {
       : _descriptor(gc_descriptor::install{}, gc.descriptor)
     {
       //assert(_descriptor.is_valid());
-      install_descriptor_epilogue(_descriptor);
     }
   public:
     /*
@@ -167,9 +169,33 @@ namespace mpgc {
   struct is_gc_wrapped<gc_wrapped<T>> : std::true_type {};
   template <typename T>
   struct is_gc_wrapped<const gc_wrapped<T>> : std::true_type {};
+
+
+  struct trace_mem_activity {
+    static void print(const void *ptr, const std::string &msg);
+
+    static void collected(const void *ptr) {
+#ifdef TRACE_COLLECTIONS      
+      print(ptr, "collected");
+#endif      
+    }
+
+    static void marked(const void *ptr) {
+#ifdef TRACE_MARKING      
+      print(ptr, "marked");
+#endif      
+    }
+
+    template <typename T>
+    static void allocated(const void *ptr) {
+#ifdef TRACE_ALLOCATIONS      
+      std::string tname = typeid(T).name();
+      print(ptr, "allocated "+tname);
+#endif      
+    }
+  };
+
   
-
-
 }
 
 

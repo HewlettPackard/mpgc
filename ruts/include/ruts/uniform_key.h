@@ -211,7 +211,6 @@ namespace ruts {
     }
   };
 
-
 }
 
 namespace std {

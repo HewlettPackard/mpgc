@@ -28,6 +28,7 @@
 #define WEAK_GC_PTR_H
 
 #include "mpgc/offset_ptr.h"
+#include "ruts/weak_key.h"
 
 namespace mpgc {
   struct gc_control_block;
@@ -37,55 +38,53 @@ namespace mpgc {
     template <typename U> friend class weak_gc_ptr;
     offset_ptr<T> _ptr;
 
-    offset_ptr<T> from_strong_to_weak(const offset_ptr<T> &rhs) {
-      constexpr auto ptr_type_fld = bits::field<special_ptr_type, std::size_t>(0, 2);
-      return rhs.is_null() ? offset_ptr<T>(nullptr) :
-                             offset_ptr<T>(rhs.val() | ptr_type_fld.encode(special_ptr_type::Weak));
-    }
-
     template <typename Fn>
-    void write_barrier(Fn&&);//For gc_ptr and nullptr
-
+    void write_barrier(const offset_ptr<T>&, Fn&&) noexcept;//For gc_ptr and nullptr
   public:
     using element_type = T;
 
+    /*
+     * Marker class to assert that an offset pointer is sitting inside another weak pointer.
+     */
+    struct inside_weak_ptr_t {};
+    constexpr static inside_weak_ptr_t inside_weak_ptr = inside_weak_ptr_t{};
+
     weak_gc_ptr() noexcept {
-      write_barrier([this] {_ptr = nullptr;});
+      write_barrier(nullptr, [this](const offset_ptr<T> &p) {_ptr = p;});
     }
     constexpr weak_gc_ptr(std::nullptr_t) noexcept : weak_gc_ptr{} {}
 
-    offset_ptr<T>& as_offset_pointer() { return _ptr; }
+    const offset_ptr<T>& as_offset_pointer() const { return _ptr; }
 
     template <typename LoadFn, typename ModFn>
     static void write_barrier(void*, const void*, LoadFn&&, ModFn&&) noexcept;
 
-    static bool marked_or_sweep_allocated(gc_control_block&, const offset_ptr<T>&);
-    static void clear_sweep_allocated(const offset_ptr<T>&);
+    static bool marked_or_sweep_assigned(gc_control_block&, const offset_ptr<T>) noexcept;
 
-    weak_gc_ptr(const offset_ptr<T> &rhs) noexcept {
+    weak_gc_ptr(inside_weak_ptr_t, const offset_ptr<T> &rhs) noexcept {
       write_barrier(this, &rhs, [&rhs]{return rhs;},
                     [this](const offset_ptr<T>& p) {_ptr = p;});
     }
-    weak_gc_ptr(offset_ptr<T> &&rhs) noexcept {
-      offset_ptr<T> r = std::move(rhs);
-      write_barrier(this, &r, [&r]{return r;}, [this](const offset_ptr<T>& p) {_ptr = p;});
+    weak_gc_ptr(inside_weak_ptr_t, offset_ptr<T> &&rhs) noexcept {
+      write_barrier(this, &rhs, [&rhs]{return rhs;},
+                    [this](const offset_ptr<T>& p) {_ptr = p;});
     }
 
     weak_gc_ptr(const weak_gc_ptr &rhs) noexcept {
-      write_barrier(this, &rhs, [&rhs] {return rhs._ptr;}, [this](const offset_ptr<T>& p) {_ptr = p;});
+      write_barrier(this, &rhs, [&rhs] {return rhs._ptr;},
+                    [this](const offset_ptr<T>& p) {_ptr = p;});
     }
     weak_gc_ptr(weak_gc_ptr &&rhs) noexcept {
-      offset_ptr<T> r = std::move(rhs._ptr);
-      write_barrier(this, &r, [&r]{return r;},
+      write_barrier(this, &rhs, [&rhs]{return rhs._ptr;},
                           [this](const offset_ptr<T>& p) {_ptr = p;});
     }
     weak_gc_ptr &operator =(const weak_gc_ptr &rhs) noexcept {
-      write_barrier(this, &rhs, [&rhs] {return rhs._ptr;}, [this](const offset_ptr<T>& p) {_ptr = p;});
+      write_barrier(this, &rhs, [&rhs] {return rhs._ptr;},
+                    [this](const offset_ptr<T>& p) {_ptr = p;});
       return *this;
     }
     weak_gc_ptr &operator =(weak_gc_ptr &&rhs) noexcept {
-      offset_ptr<T> r = std::move(rhs._ptr);
-      write_barrier(this, &r, [&r]{return r;},
+      write_barrier(this, &rhs, [&rhs]{return rhs._ptr;},
                           [this](const offset_ptr<T>& p) {_ptr = p;});
       return *this;
     }
@@ -97,21 +96,18 @@ namespace mpgc {
     }
     template <typename Y, typename = std::enable_if_t<std::is_assignable<T*&,Y*>::value> >
     weak_gc_ptr(weak_gc_ptr<Y> &&rhs) noexcept {
-      offset_ptr<Y> r = std::move(rhs._ptr);
-      write_barrier(this, &r, [&r]{return r;},
+      write_barrier(this, &rhs, [&rhs]{return rhs._ptr;},
                           [this](const offset_ptr<T>& p) {_ptr = p;});
     }
     template <typename Y, typename = std::enable_if_t<std::is_assignable<T*&,Y*>::value> >
     weak_gc_ptr(const gc_ptr<Y> &rhs) noexcept {
-      write_barrier([this, &rhs] {
-        _ptr = from_strong_to_weak(rhs.as_offset_pointer());
-      });
+      write_barrier(rhs.as_offset_pointer(),
+                    [this](const offset_ptr<T> &p) {_ptr = p;});
     }
     template <typename Y, typename = std::enable_if_t<std::is_assignable<T*&,Y*>::value> >
     weak_gc_ptr(gc_ptr<Y> &&rhs) noexcept {
-      write_barrier([this, r = std::move(rhs.as_offset_pointer())] {
-        _ptr = from_strong_to_weak(r);
-      });
+      write_barrier(std::move(rhs.as_offset_pointer()),
+                    [this](const offset_ptr<T> &p) {_ptr = p;});
     }
     template <typename Y, typename = std::enable_if_t<std::is_assignable<T*&,Y*>::value> >
     weak_gc_ptr(const external_gc_ptr<Y> &rhs) noexcept : weak_gc_ptr{rhs.value()} {}
@@ -120,37 +116,35 @@ namespace mpgc {
     weak_gc_ptr(external_gc_ptr<Y> &&rhs) noexcept : weak_gc_ptr{std::move(rhs.value())} {}
 
     weak_gc_ptr &operator =(nullptr_t) noexcept {
-      write_barrier([this]{_ptr = nullptr;});
+      write_barrier(nullptr, [this](const offset_ptr<T> &p) {_ptr = p;});
       return *this;
     }
 
     template <typename Y, typename = std::enable_if_t<std::is_assignable<T*&,Y*>::value> >
     weak_gc_ptr &operator =(const weak_gc_ptr<Y> &rhs) noexcept {
-      write_barrier(this, &rhs, [&rhs]{return rhs._ptr;}, [this](const offset_ptr<T>& p) {_ptr = p;});
+      write_barrier(this, &rhs, [&rhs]{return rhs._ptr;},
+                    [this](const offset_ptr<T>& p) {_ptr = p;});
       return *this;
     }
 
     template <typename Y, typename = std::enable_if_t<std::is_assignable<T*&,Y*>::value> >
     weak_gc_ptr &operator =(weak_gc_ptr<Y> &&rhs) noexcept {
-      offset_ptr<Y> r = std::move(rhs._ptr);
-      write_barrier(this, &r, [&r]{return r;},
+      write_barrier(this, &rhs, [&rhs]{return rhs._ptr;},
                           [this](const offset_ptr<T>& p) {_ptr = p;});
       return *this;
     }
 
     template <typename Y, typename = std::enable_if_t<std::is_assignable<T*&,Y*>::value> >
     weak_gc_ptr &operator =(const gc_ptr<Y> &rhs) noexcept {
-      write_barrier([this, &rhs] {
-        _ptr = from_strong_to_weak(rhs.as_offset_pointer());
-      });
+      write_barrier(rhs.as_offset_pointer(),
+                    [this](const offset_ptr<T> &p) {_ptr = p;});
       return *this;
     }
 
     template <typename Y, typename = std::enable_if_t<std::is_assignable<T*&,Y*>::value> >
     weak_gc_ptr &operator =(gc_ptr<Y> &&rhs) noexcept {
-      write_barrier([this, r = std::move(rhs.as_offset_pointer())] {
-        _ptr = from_strong_to_weak(r);
-      });
+      write_barrier(std::move(rhs.as_offset_pointer()),
+                    [this](const offset_ptr<T> &p) {_ptr = p;});
       return *this;
     }
 
@@ -167,10 +161,7 @@ namespace mpgc {
     }
 
     gc_ptr<T> lock() const noexcept;
-
-    bool expired() const noexcept {
-      return _ptr == nullptr;
-    }
+    bool expired() const noexcept;
 
     void reset() {
       *this = nullptr;
@@ -226,6 +217,39 @@ namespace ruts {
     }
   };
 
+  template <typename T>
+  struct weak_key_traits<mpgc::weak_gc_ptr<T>>
+  {
+    using weak_type = mpgc::weak_gc_ptr<T>;
+    using strong_type = mpgc::gc_ptr<T>;
+    static weak_type convert(const strong_type &p) noexcept {
+      return p;
+    }
+    static strong_type lock(const weak_type &p) noexcept {
+      return p.lock();
+    }
+    static bool expired(const weak_type &p) noexcept {
+      return p.expired();
+    }
+    static bool equals(const weak_type &lhs, const weak_type &rhs) noexcept {
+      /*
+       * We don't want to lock unless we have to.
+       */
+      if (lhs.expired()) {
+        return rhs.expired();
+      }
+      if (rhs.expired()) {
+        return false;
+      }
+      return lock(lhs) == lock(rhs);
+    }
+    static auto extract_stable(const strong_type &ptr) {
+      return stable_key<T>()(*ptr);
+    }
+
+    using stable_key_type = std::decay_t<decltype(extract_stable(std::declval<strong_type>()))>;
+
+  };
 }
 
 namespace std {
@@ -278,6 +302,7 @@ namespace std {
     using opvpt = versioned_pointer_traits<mpgc::offset_ptr<T>>;
   public:
     using prim_rep = typename opvpt::prim_rep;
+    constexpr static size_t AddressBits = opvpt::AddressBits;
 
     template <typename M>
     static void construct_prim_rep(const void *loc,
@@ -291,16 +316,16 @@ namespace std {
       }
     }
     constexpr static mpgc::weak_gc_ptr<T> from_prim_rep(prim_rep p) {
-      return mpgc::weak_gc_ptr<T>(opvpt::from_prim_rep(p));
+      return mpgc::weak_gc_ptr<T>(mpgc::weak_gc_ptr<T>::inside_weak_ptr, opvpt::from_prim_rep(p));
     }
     constexpr static prim_rep to_prim_rep(mpgc::weak_gc_ptr<T> p) {
       return opvpt::to_prim_rep(p.as_offset_pointer());
     }
     template <typename M, typename OV, typename NV>
     static void modify(const void *loc, M&& mod, OV&& old_val, NV&& new_val) {
-      mpgc::offset_ptr<T> n_val = forward<NV>(new_val)().as_offset_pointer();
+      mpgc::weak_gc_ptr<T> n_val = forward<NV>(new_val)();
       mpgc::weak_gc_ptr<T>::write_barrier(loc, &n_val,
-                   [&n_val]{return n_val;},
+                   [&n_val]{return n_val.as_offset_pointer();},
                    [mod=forward<M>(mod)](const mpgc::offset_ptr<T> &p){
                      return mod(reinterpret_cast<const mpgc::weak_gc_ptr<T>&>(p));
                    });
@@ -455,13 +480,26 @@ namespace std {
     {
       // mark expected
       bool ret;
+      mpgc::offset_ptr<T> orig_exp = expected.as_offset_pointer();
+      orig_exp.remove_sweep_assigned();
       mpgc::weak_gc_ptr<T>::write_barrier(this, &desired,
             [&desired]{return desired.as_offset_pointer();},
             [&](const mpgc::offset_ptr<T> &p) {
-              ret = base::compare_exchange_strong(expected,
-                                                  reinterpret_cast<const mpgc::weak_gc_ptr<T>&>(p),
-                                                  success,
-                                                  failure);
+              while(true) {
+                ret = base::compare_exchange_strong(expected,
+                                                    reinterpret_cast<const mpgc::weak_gc_ptr<T>&>(p),
+                                                    success,
+                                                    failure);
+                if (ret) {
+                  break;
+                } else {
+                  mpgc::offset_ptr<T> exp_offset = expected.as_offset_pointer();
+                  exp_offset.remove_sweep_assigned();
+                  if (orig_exp != exp_offset) {
+                    break;
+                  }
+                }
+              }
             }
       );
       return ret;
@@ -478,13 +516,26 @@ namespace std {
                                  std::memory_order failure) volatile
     {
       bool ret;
+      mpgc::offset_ptr<T> orig_exp = expected.as_offset_pointer();
+      orig_exp.remove_sweep_assigned();
       mpgc::weak_gc_ptr<T>::write_barrier(this, &desired,
             [&desired]{return desired.as_offset_pointer();},
             [&](const mpgc::offset_ptr<T> &p) {
-              ret = base::compare_exchange_strong(expected,
-                                                  reinterpret_cast<const mpgc::weak_gc_ptr<T>&>(p),
-                                                  success,
-                                                  failure);
+              while(true) {
+                ret = base::compare_exchange_strong(expected,
+                                                    reinterpret_cast<const mpgc::weak_gc_ptr<T>&>(p),
+                                                    success,
+                                                    failure);
+                if (ret) {
+                  break;
+                } else {
+                  mpgc::offset_ptr<T> exp_offset = expected.as_offset_pointer();
+                  exp_offset.remove_sweep_assigned();
+                  if (orig_exp != exp_offset) {
+                    break;
+                  }
+                }
+              }
             }
       );
       return ret;

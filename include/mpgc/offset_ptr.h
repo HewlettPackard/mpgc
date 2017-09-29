@@ -43,7 +43,7 @@ namespace mpgc {
   namespace gc_handshake {
     struct in_memory_thread_struct;
     template <typename Fn, typename ...Args>
-    void process_stack(const std::size_t*, const std::size_t*, Fn&&, Args&& ...);
+    void process_stack(in_memory_thread_struct&, const std::size_t*, const std::size_t*, Fn&&, Args&& ...);
     void process_stack_weak_ptrs(in_memory_thread_struct&, std::size_t*, std::size_t * const);
   }
 
@@ -54,11 +54,15 @@ namespace mpgc {
   template <typename T> class offset_ptr;
   template <typename T> class gc_ptr;
   template <typename T> class weak_gc_ptr;
+  template <typename T> class controlled_gc_ptr;
+  template <typename X, typename Y> class contingent_gc_ptr;
 
   enum class special_ptr_type : unsigned char {
-    Strong = 0,
-    Weak = 1,
-    Contingent = 2
+    Strong = 0b000,
+    Weak = 0b001,
+    Contingent = 0b010,
+    Sweep_assigned_no_weak = 0b100, //For internal use only
+    Sweep_assigned = 0b101 //Also indicates that it's a weak ptr
   };
 
   class base_offset_ptr {
@@ -81,7 +85,8 @@ namespace mpgc {
     constexpr static uint8_t* const &_internal_base = _signed_base;
     constexpr static uint8_t* const &_end = _heap_end;
     constexpr static std::size_t const &_heap_size_in_bytes = _heap_size;
-    constexpr static auto ptr_type_fld = bits::field<special_ptr_type, std::size_t>(0, 2);
+    constexpr static auto ptr_type_2bit_fld =
+                        bits::field<special_ptr_type, std::size_t>(0, 2);
 
     std::size_t _offset;
 
@@ -122,6 +127,9 @@ namespace mpgc {
     //returns the offset which can directly be added to base() to get a real pointer
     constexpr std::size_t offset() const {
       return _offset & offset_mask();
+    }
+    constexpr static std::size_t remove_special_bits(size_t offset) {
+      return ptr_type_fld.replace(offset, special_ptr_type::Strong);
     }
 
   protected:
@@ -200,6 +208,7 @@ namespace mpgc {
     base_offset_ptr &operator =(base_offset_ptr &&rhs) = default;
 
   public:
+    constexpr static auto ptr_type_fld = bits::field<special_ptr_type, std::size_t>(0, 3);
     constexpr static uint8_t* base() { return _base; }
     constexpr static uint8_t* end()  { return _end;  }
 
@@ -239,8 +248,59 @@ namespace mpgc {
       return base_offset_ptr::is_weak(_offset);
     }
 
-    constexpr static bool is_weak(std::size_t offset) {
-      return ptr_type_fld.decode(offset) == special_ptr_type::Weak;
+    constexpr bool is_contingent() const {
+      return base_offset_ptr::is_contingent(_offset);
+    }
+
+    constexpr bool is_sweep_assigned() const {
+      return base_offset_ptr::is_sweep_assigned(_offset);
+    }
+
+    constexpr bool is_strong() const {
+      return base_offset_ptr::is_strong(_offset);
+    }
+
+    constexpr static bool is_weak(const std::size_t offset) {
+      //We intentionally discard the third bit, so that weak check can be done in one condition.
+      return ptr_type_2bit_fld.decode(offset) == special_ptr_type::Weak;
+    }
+
+    constexpr static bool is_contingent(const std::size_t offset) {
+      return ptr_type_fld.decode(offset) == special_ptr_type::Contingent;
+    }
+
+    constexpr static bool is_sweep_assigned(const std::size_t offset) {
+      return ptr_type_fld.decode(offset) == special_ptr_type::Sweep_assigned;
+    }
+
+    constexpr static bool is_strong(const std::size_t offset) {
+      return ptr_type_fld.decode(offset) == special_ptr_type::Strong;
+    }
+
+    void set_sweep_assigned(const base_offset_ptr &other) {
+      _offset = ptr_type_fld.replace(other._offset, special_ptr_type::Sweep_assigned);
+    }
+    void set_weak_assigned(const base_offset_ptr &other) {
+      _offset = ptr_type_fld.replace(other._offset, special_ptr_type::Weak);
+    }
+
+    void remove_special_bits() {
+      _offset = base_offset_ptr::remove_special_bits(_offset);
+    }
+    void remove_special_bits(base_offset_ptr& other) {
+      _offset = base_offset_ptr::remove_special_bits(other._offset);
+    }
+
+    void remove_sweep_assigned() {
+      std::size_t only_bit = ptr_type_fld.encode(special_ptr_type::Sweep_assigned_no_weak);
+      _offset &= ~only_bit;
+    }
+
+    bool atomic_remove_sweep_assigned(const base_offset_ptr &exp) {
+      std::size_t exp_offset = exp._offset;
+      std::size_t only_bit = ptr_type_fld.encode(special_ptr_type::Sweep_assigned_no_weak);
+      std::atomic<std::size_t> &atomic_offset = reinterpret_cast<std::atomic<std::size_t> &>(_offset);
+      return atomic_offset.compare_exchange_strong(exp_offset, exp_offset & ~only_bit);
     }
 
     constexpr std::size_t as_number() const {
@@ -254,9 +314,11 @@ namespace mpgc {
     template <typename U> friend class offset_ptr;
     friend class std::versioned_pointer_traits<offset_ptr<T>>;  
     friend class gc_descriptor;
-    template <typename Fn, typename ...Args> friend void gc_handshake::process_stack(const std::size_t*, const std::size_t*, Fn&&, Args&& ...);
+    template <typename Fn, typename ...Args> friend void gc_handshake::process_stack(gc_handshake::in_memory_thread_struct&, const std::size_t*, const std::size_t*, Fn&&, Args&& ...);
     friend void gc_handshake::process_stack_weak_ptrs(gc_handshake::in_memory_thread_struct&, std::size_t*, std::size_t * const);
     friend class weak_gc_ptr<T>;
+    friend class controlled_gc_ptr<T>;
+    template <typename X, typename Y> friend class contingent_gc_ptr;
     friend class mark_bitmap;
 
     constexpr explicit offset_ptr(std::size_t o) : base_offset_ptr(o) {}
@@ -264,11 +326,10 @@ namespace mpgc {
   public:
 
     using difference_type = std::ptrdiff_t;
-    using value_type = T;
     using element_type = T;
-    using pointer = value_type *;
-    using reference = value_type &;
+    using reference = T&;
     using iterator_category = std::random_access_iterator_tag;
+    template<typename U> using rebind = offset_ptr<U>;
 
     constexpr offset_ptr() noexcept : base_offset_ptr() {}
     constexpr offset_ptr(std::nullptr_t) noexcept : offset_ptr() {}
@@ -331,6 +392,10 @@ namespace mpgc {
       return as_bare_pointer();
     }
 
+    T &operator [](std::size_t i) const noexcept {
+      return *(as_bare_pointer() + i);
+    }
+
     void swap (offset_ptr &other) noexcept {
       std::size_t temp = val();
       set_val(other.val());
@@ -338,7 +403,7 @@ namespace mpgc {
     }
 
     constexpr operator bool() const noexcept {
-      return val() != 0;
+      return !is_null();
     }
 
     template <typename U>
@@ -381,6 +446,9 @@ namespace mpgc {
     }
 
     offset_ptr operator +(difference_type delta) const {
+      return offset_ptr(val() + delta * sizeof(T));
+    }
+    offset_ptr operator +(std::size_t delta) const {
       return offset_ptr(val() + delta * sizeof(T));
     }
     offset_ptr operator -(difference_type delta) const {
@@ -532,6 +600,7 @@ namespace std {
     : default_versioned_pointer_traits<mpgc::offset_ptr<T>>
   {
     using prim_rep = size_t;
+    constexpr static size_t AddressBits = mpgc::offset_ptr<T>::used_bits();
     constexpr static mpgc::offset_ptr<T> from_prim_rep(prim_rep p) { return mpgc::offset_ptr<T>(p);}
     constexpr static prim_rep to_prim_rep(mpgc::offset_ptr<T> p) { return p.val();}
   };

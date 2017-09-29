@@ -195,6 +195,30 @@ namespace ruts {
     return stream.str();
   }
 
+  class comma_numpunct : public std::numpunct<char>
+  {
+  protected:
+    char do_thousands_sep() const override {
+      return ',';
+    }
+    std::string do_grouping() const override {
+      return "\03";
+    }
+  public:
+    static const std::locale &in_locale() {
+      static std::locale cl(std::locale(), new comma_numpunct());
+      return cl;
+    }
+  };
+
+  template <typename T>
+  inline std::string comma_sep(const T &val) {
+    return format([&val](auto &os) {
+        os.imbue(comma_numpunct::in_locale());
+        os << val;
+      });
+  }
+
 
   template <typename Fn>
   class in_dtor {

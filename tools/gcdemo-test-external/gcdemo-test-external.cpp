@@ -14,24 +14,58 @@ static external_weak_gc_ptr<Comment> gwp;
 //external_gc_ptr<Comment> gsp;
 void foo() __attribute__ ((noinline));
 
-void foo()
-{
-  gwp = make_gc<Comment>();
+class with_cp : public gc_allocated {
+  gc_ptr<User>                     _dummy;
+  contingent_gc_ptr<Comment, User> _test;
+
+ public:
+  with_cp(gc_token &gc, gc_ptr<Comment> &c, gc_ptr<User> &u)
+    : gc_allocated(gc), _dummy(u), _test(c, u) {}
+
+  static const auto &descriptor() {
+    static gc_descriptor d =
+      GC_DESC(with_cp)
+      .template WITH_FIELD(&with_cp::_dummy)
+      .template WITH_FIELD(&with_cp::_test);
+    return d;
+  }
+
+  void print() const {
+    gc_ptr<User> u = _test.lock();
+    if (u) {
+      cout << u->name << "\n";
+    }
+  }
+};
+
+gc_ptr<with_cp> foo(gc_ptr<User> u) {
+  gc_ptr<Comment> c = make_gc<Comment>();
+  gwp = c;
   cout <<"Allocated\n";
+  return make_gc<with_cp>(c, u);
+}
+
+void print_comment(gc_ptr<Comment> c) {
+  if (c) {
+   cout << c->commentText << "\n";
+  }
 }
 
 int main(int argc, char *argv[]) {
-  foo();
   string prName = "com.hpe.gcdemo.users";
   UserGraphPtr userPtr = persistent_roots().lookup<WrappedUserGraph>(prName);
-  deque<ptr_type> deque;
   UniformRNG rng(userPtr->size());
+  gc_ptr<with_cp> cp = foo((*userPtr)[rng.randElt()]);
+  deque<ptr_type> deque;
+
   for (size_t i = 0; i < 32; i++) {
     auto feed = (*userPtr)[rng.randElt()]->feed.load();
-    deque.push_back(feed->back());
+    if (feed) {
+      deque.push_back(feed->back());
+    }
   }
 
-  for (int i = 0; i < atoi(argv[1]); i++)
+  for (int i = 0; i < atoi(argv[1]); i+=4)
     this_thread::sleep_for(5s);
 
   size_t i = 1;
@@ -43,9 +77,12 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  gc_ptr<Comment> p = gwp.lock();
-  if (p) {
-    cout << p->commentText << "\n";
-  }
+  print_comment(gwp.lock());
+
+  cout << "Printing user info now\n";
+  for (int i = 0; i < atoi(argv[1]); i++)
+    this_thread::sleep_for(5s);
+
+  cp->print();
   return 0;
 }

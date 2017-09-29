@@ -32,18 +32,63 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "ruts/uniform.h"
+#include "ruts/uniform_key.h"
+#include "ruts/cuckoo_map.h"
 
 namespace mpgc {
+  template <typename T>
+  class white_allocator {
+   public:
+    using size_type = std::size_t;
+    using difference_type = typename offset_ptr<T>::difference_type;
+    using pointer = offset_ptr<T>;
+    using const_pointer = offset_ptr<const T>;
+    using reference = T&;
+    using const_reference = const T&;
+    using value_type = T;
+    template <typename T2> struct rebind
+    {
+      using other = white_allocator<T2>;
+    };
+    using propagate_on_container_move_assignment = std::true_type;
+    // static_assert(alignof(T) <= 8, "White allocation doesn't respect special alignment requests.");
 
-/*
- * FIXME: The global control map is the ulimate goal. However,
- * for that to work, the GC-internal data structures need to
- * start using gc heap instead of pheap. Until then we will
- * use the process-local control maps.
+    white_allocator() throw() {}
+    white_allocator(const white_allocator&) throw() {}
+    template <typename T2> white_allocator(const white_allocator<T2>&) throw() {}
+    ~white_allocator() throw() {}
+
+    pointer allocate(const size_t);
+
+    void deallocate(pointer ptr, size_type n)
+    {
+      //Do nothing for now. We can eventually maintain a list to be reused.
+    }
+
+    template <typename U>
+    void destroy(offset_ptr<U> ptr)
+    {
+      ptr->~U();
+    }
+
+    void destroy(offset_ptr<T> ptr) {
+      ptr->~T();
+    }
+
+    template <typename U, typename... Args>
+    void construct(offset_ptr<U> ptr, Args&&... args)
+    {
+      new (static_cast<void*>(ptr)) U(std::forward<Args>(args)...);
+    }
+
+    template <typename... Args>
+    void construct(offset_ptr<T> ptr, Args&&... args) {
+      new (static_cast<void*>(ptr)) T(std::forward<Args>(args)...);
+    }
+  };
 
   struct weak_ctrl_map_key {
-    ruts::uniform_key k;
+    ruts::uniform_key id;
 
     weak_ctrl_map_key() = delete;
     weak_ctrl_map_key(const weak_ctrl_map_key &) = default;
@@ -53,29 +98,51 @@ namespace mpgc {
 
     constexpr static auto computed = ruts::uniform_key::computed;
 
-    weak_ctrl_map_key(const offset_ptr<const gc_allocated> &p) : k(computed, p) {}
-    weak_ctrl_map_key(const offset_ptr<const gc_allocated> &&p) : k(computed, std::move(p)) {}
+    weak_ctrl_map_key(const ruts::uniform_key &key) : id(key) {}
+    weak_ctrl_map_key(const ruts::with_uniform_id &wuid) : id(wuid.id) {}
+
+    weak_ctrl_map_key(const offset_ptr<const gc_allocated> &p)
+      : id(computed, p.as_number()) {}
+    weak_ctrl_map_key(offset_ptr<const gc_allocated> &&p)
+      : id(computed, std::move(p.as_number())) {}
 
     bool operator==(const weak_ctrl_map_key &other) const {
-      return k == other.k;
+      return id == other.id;
     }
     bool operator!=(const weak_ctrl_map_key &other) const {
-      return k != other.k;
+      return id != other.id;
     }
 
     template <typename CharT, typename Traits>
     friend std::basic_ostream<CharT, Traits> &operator <<(std::basic_ostream<CharT, Traits> &out,
                                                           const weak_ctrl_map_key &key)
     {
-      return out << key.k;
+      return out << key.id;
     }
 
   };
+}
 
+namespace ruts {
+  template <>
+  struct hash1<mpgc::weak_ctrl_map_key> {
+    auto operator()(const mpgc::weak_ctrl_map_key &key) const {
+      return hash1<uniform_key>{}(key.id);
+    }
+  };
+  template <>
+  struct hash2<mpgc::weak_ctrl_map_key> {
+    auto operator()(const mpgc::weak_ctrl_map_key &key) const {
+      return hash2<uniform_key>{}(key.id);
+    }
+  };
+}
+
+namespace mpgc {
   struct weak_ctrl_map_val {
-    using T = const offset_ptr<const gc_allocated>;
-
-    static constexpr int64_t buffer_size = mark_buffer<T>::buffer_size;
+    using T = offset_ptr<const gc_allocated>;
+    //static constexpr int64_t buffer_size = mark_buffer<T>::buffer_size;
+    static constexpr int64_t buffer_size = 16;
     struct buffer {
       std::atomic<int64_t> idx;
       T buf[buffer_size];
@@ -84,34 +151,110 @@ namespace mpgc {
       }
     };
 
-    using val_t = ruts::lf_stack<buffer, ruts::managed_space::allocator<buffer>>;
-    val_t *v;
+    using val_t = ruts::lf_stack<buffer, white_allocator<buffer>>;
+    val_t v;
 
-    //Allocation of value will be dealt with in the control map itself
-    weak_ctrl_map_val() = delete;
+    weak_ctrl_map_val() : v{}
+      {}
+
+    void add(const T& p) {
+      offset_ptr<buffer> b = v.head();
+      while (true) {
+        if (!b || b->idx >= buffer_size) {
+          offset_ptr<buffer> t = v.allocate();
+          v.push(t);
+          b = t;
+        }
+        int64_t i = b->idx++;
+        if (i < buffer_size) {
+          b->buf[i] = p;
+          break;
+        }
+      }
+    }
+    template<typename Fn>
+    void process_and_remove(Fn &&func) {
+      offset_ptr<buffer> b;
+      v.pop(b);
+      while (b) {
+        for (int64_t i = 0; i < buffer_size; i++) {
+          std::forward<Fn>(func)(b->buf[i]);
+        }
+        v.pop(b);
+      }
+    }
   };
 
   class weak_ctrl_map {
     using key_type = weak_ctrl_map_key;
     using val_type = weak_ctrl_map_val;
-    using map_type = cuckoo_map<key_type, val_type, ruts::hash1<key_type>, ruts::hash2<key_type>,
-                                10, ruts::managed_space::allocator<val_type>>;
-    using Allocator = ruts::managed_space::allocator<val_type::val_t>;
-    map_type map;
-    Allocator alloc;
+    using ptr_type = offset_ptr<val_type>;
+    using map_type = ruts::cuckoo_map<key_type, ptr_type,
+                                      ruts::hash1<key_type>, ruts::hash2<key_type>,
+                                      3, white_allocator<ptr_type>>;
+    using val_allocator = white_allocator<val_type>;
+    using map_allocator = white_allocator<map_type>;
 
-   public:    
+    union {
+      std::atomic<offset_ptr<map_type>> _atomic_map;
+      offset_ptr<map_type>              _map;
+    };
+    val_allocator v_alloc;
+    map_allocator m_alloc;
 
+    ptr_type store_new(key_type key) {
+      bool has_val;
+      ptr_type current;
+      std::tie(has_val, current) = _map->lookup(key);
+
+      if (has_val) {
+        return current;
+      }
+
+      ptr_type new_val = v_alloc.allocate(1);
+      v_alloc.construct(new_val);
+      auto rr = _map->put_new(key, new_val);
+      if (rr.replaced) {
+        return new_val;
+      } else {
+        return rr.old_value;
+      }
+    }
+
+    void initialize() {
+      if (!_map) {
+        offset_ptr<map_type> exp = nullptr;
+        offset_ptr<map_type> des = m_alloc.allocate(1);
+        m_alloc.construct(des);
+        _atomic_map.compare_exchange_strong(exp, des);
+      }
+    }
+
+   public:
+    weak_ctrl_map(offset_ptr<map_type> m) noexcept : _map(m) {}
+
+    void clear() {
+      _map = nullptr;
+    }
+
+    void insert(const offset_ptr<const gc_allocated> &k,
+                const offset_ptr<const gc_allocated> &v) {
+      initialize();
+      ptr_type stack = store_new(k);
+      stack->add(v);
+    }
+
+    template <typename Fn>
+    void process_and_remove(const offset_ptr<const gc_allocated> &k, Fn &&func) {
+      if (_map != nullptr) {
+        ptr_type stack = _map->get(k);
+        if (stack) {
+          stack->process_and_remove(std::forward<Fn>(func));
+          _map->remove(k);
+        }
+      }
+    }
   };
- */
-
- using weak_ctrl_map_key = offset_ptr<const gc_allocated>;
-
- using weak_ctrl_map_val = std::unordered_set<weak_ctrl_map_key, std::hash<weak_ctrl_map_key>,
-                           std::equal_to<weak_ctrl_map_key>, ruts::managed_space::allocator<weak_ctrl_map_key>>;
-
- using weak_ctrl_map = std::unordered_map<weak_ctrl_map_key, weak_ctrl_map_val, std::hash<weak_ctrl_map_key>,
-                       std::equal_to<weak_ctrl_map_key>, ruts::managed_space::allocator<std::pair<const weak_ctrl_map_key, weak_ctrl_map_val>>>;
 }
 
 #endif //WEAK_CTRL_MAP_H

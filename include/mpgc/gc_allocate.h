@@ -74,6 +74,7 @@ namespace mpgc {
       gc_handshake::in_memory_thread_struct& ts = allocation_prologue();
       void *ptr = gc_allocator::alloc(ts, sizeof(T), alignof(T));
       allocation_epilogue(ts, ptr, tok, 0);
+      trace_mem_activity::allocated<T>(ptr);
 
       auto res = new (ptr) T(tok, std::forward<Args>(args)...);
       assert(&(res->get_gc_descriptor()) == ptr);
@@ -107,6 +108,7 @@ namespace mpgc {
       gc_handshake::in_memory_thread_struct& ts = allocation_prologue();
       void *ptr = allocate_space_for(ts, n);
       allocation_epilogue(ts, ptr, tok, n);
+      trace_mem_activity::allocated<gc_array<T>>(ptr);
       return std::make_pair(ptr, tok);
     }
 

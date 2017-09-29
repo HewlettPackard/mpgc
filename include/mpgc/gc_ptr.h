@@ -1350,6 +1350,7 @@ namespace std {
     using opvpt = versioned_pointer_traits<mpgc::offset_ptr<T>>;
   public:
     using prim_rep = typename opvpt::prim_rep;
+    constexpr static size_t AddressBits = opvpt::AddressBits;
 
     constexpr static mpgc::gc_ptr<T> from_prim_rep(prim_rep p) {
       return mpgc::gc_ptr<T>::from_offset_ptr(opvpt::from_prim_rep(p));
