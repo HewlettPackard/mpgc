@@ -35,7 +35,6 @@
 #define META_H_
 
 #include <type_traits>
-#include <functional>
 
 namespace meta {
 
@@ -68,36 +67,7 @@ namespace meta {
   template <typename Fn, typename ... Args, typename R>
   struct is_callable<Fn(Args...), R> : _is_callable_base<Fn(Args...), R> {};
   
-  template <typename T>
-  struct as_function : public as_function<decltype(&T::operator())>
-  {};
-
-  template <typename RT, typename...AT>
-  struct as_function<RT(AT...)> {
-    using type = std::function<RT(AT...)>;
-  };
-
-  template <typename RT, typename...AT>
-  struct as_function<RT(*)(AT...)> : as_function<RT(AT...)> {};
-
-  template <typename RT, typename...AT>
-  struct as_function<RT(&)(AT...)> : as_function<RT(AT...)> {};
-
-  template <typename C, typename RT, typename...AT>
-  struct as_function<RT(C::*)(AT...) const> : as_function<RT(const C &, AT...)> {};
-
-  template <typename C, typename RT, typename...AT>
-  struct as_function<RT(C::*)(AT...)> : as_function<RT(C &, AT...)> {};
-
-  template <typename C, typename T>
-  struct as_function<T C::*> : as_function<T(C &)> {};
-
-  template <typename C, typename T>
-  struct as_function<T C::* const> : as_function<T(const C &)> {};
-
-  template <typename T>
-  using as_function_t = typename as_function<T>::type;
-
+  
 }
 
 

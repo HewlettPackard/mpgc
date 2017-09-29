@@ -47,7 +47,6 @@
 
 namespace mpgc {
   extern void initialize();
-  extern volatile uint8_t request_gc_termination;
   
     namespace inbound_pointers {
       using target_base = const gc_allocated;
@@ -279,14 +278,9 @@ namespace mpgc {
               auto &slot = _table[i];
               _free = slot.next_free;
               slot.reset(gcp);
-              auto deleter = [i](target_base *tb) {
-                // std::cout << "// Dropping external " << typeid(T).name()
-                // << ": " << offset_ptr<target_base>(tb) << std::endl;
-
+              auto deleter = [i](target_base *) {
                 ic_control::block().release(i);
               };
-              // std::cout << "// Creating external " << typeid(T).name()
-              // << ": " << offset_ptr<target_base>(ptr) << std::endl;
               std::shared_ptr<target_base> res{ptr, deleter};
               return res;
             };
@@ -1060,8 +1054,8 @@ namespace mpgc {
     {}
 
     ~external_weak_gc_ptr() noexcept {
-      if (!request_gc_termination && _slot != nullptr) {
-        iwt::drop_reference(_slot);
+      if (_slot != nullptr) {
+        iwt::release_slot(_slot);
         _slot = nullptr;
       }
     }

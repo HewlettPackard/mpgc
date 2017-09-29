@@ -29,9 +29,10 @@
 
 using namespace mpgc;
 using namespace std;
+using namespace ruts;
 
 int main() {
-  using string_table_type = gc_interned_string_table<0>;
+  using string_table_type = gc_interned_string_table<small_gc_cm_traits>;
   using string_type = typename string_table_type::value_type;
   using map_type = small_gc_cuckoo_map<string_type, size_t>;
 

@@ -41,14 +41,7 @@
 
 namespace mpgc {
   namespace gc_handshake {
-    struct in_memory_thread_struct;
-    template <typename Fn, typename ...Args>
-    void process_stack(const std::size_t*, const std::size_t*, Fn&&, Args&& ...);
-    void process_stack_weak_ptrs(in_memory_thread_struct&, std::size_t*, std::size_t * const);
-  }
-
-  namespace gc_allocator {
-    class skiplist;
+    template <typename Fn, typename ...Args> void process_stack(const std::size_t*, const std::size_t*, Fn&&, Args&& ...);
   }
 
   template <typename T> class offset_ptr;
@@ -90,7 +83,7 @@ namespace mpgc {
      */
     friend class gc_descriptor;
     friend class mark_bitmap;
-    friend class gc_allocator::skiplist;
+
 
     constexpr static std::size_t offset_mask() {
       return (static_cast<std::size_t>(1) << _offset_bits) - 1;
@@ -255,9 +248,8 @@ namespace mpgc {
     friend class std::versioned_pointer_traits<offset_ptr<T>>;  
     friend class gc_descriptor;
     template <typename Fn, typename ...Args> friend void gc_handshake::process_stack(const std::size_t*, const std::size_t*, Fn&&, Args&& ...);
-    friend void gc_handshake::process_stack_weak_ptrs(gc_handshake::in_memory_thread_struct&, std::size_t*, std::size_t * const);
     friend class weak_gc_ptr<T>;
-    friend class mark_bitmap;
+    friend class gc_allocator;
 
     constexpr explicit offset_ptr(std::size_t o) : base_offset_ptr(o) {}
     
@@ -265,7 +257,6 @@ namespace mpgc {
 
     using difference_type = std::ptrdiff_t;
     using value_type = T;
-    using element_type = T;
     using pointer = value_type *;
     using reference = value_type &;
     using iterator_category = std::random_access_iterator_tag;
@@ -529,11 +520,15 @@ namespace std {
 
   template <typename T>
   struct versioned_pointer_traits<mpgc::offset_ptr<T>>
-    : default_versioned_pointer_traits<mpgc::offset_ptr<T>>
+    : pointer_traits<mpgc::offset_ptr<T>>
   {
     using prim_rep = size_t;
     constexpr static mpgc::offset_ptr<T> from_prim_rep(prim_rep p) { return mpgc::offset_ptr<T>(p);}
     constexpr static prim_rep to_prim_rep(mpgc::offset_ptr<T> p) { return p.val();}
+    template <typename M, typename OV, typename NV>
+    static void modify(M&& mod, OV&& old_val, NV&&new_val) {
+      std::forward<M>(mod)();
+    }
   };
 
 

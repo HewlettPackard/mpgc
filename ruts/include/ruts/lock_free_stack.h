@@ -48,28 +48,17 @@
 namespace ruts {
   template <typename T, typename A = std::allocator<T>>
   class lf_stack {
-   public:
-     template<typename U>
-     using pointer
-     = std::conditional_t<std::is_const<U>::value,
-                          typename std::allocator_traits<A>
-                          ::template rebind_alloc<std::remove_const_t<U>>
-                          ::const_pointer,
-                          typename std::allocator_traits<A>
-                          ::template rebind_alloc<std::remove_const_t<U>>
-                          ::pointer>;
-   private:
      struct entry {
        T value;
-       pointer<entry> next;
+       entry * volatile next;
      };
 
      struct alignas(16) versioned_head {
-       pointer<entry> ptr;
+       entry *ptr;
        std::size_t version;
 
        versioned_head() : ptr(nullptr), version(0) {}
-       versioned_head(pointer<entry> p, std::size_t v) : ptr(p), version(v) {}
+       versioned_head(entry *p, std::size_t v) : ptr(p), version(v) {}
      };
 
      using entry_allocator_type = typename std::allocator_traits<A>::template rebind_alloc<entry>;
@@ -85,8 +74,8 @@ namespace ruts {
        clear();
      }
 
-     constexpr pointer<T> head() const {
-       pointer<entry> p = _head.load().ptr;
+     constexpr T *head() const {
+       entry *p = _head.load().ptr;
        return p ? &p->value : nullptr;
      }
 
@@ -109,33 +98,32 @@ namespace ruts {
      }
 
      template <typename ...Args>
-     pointer<T> allocate(Args&&... args) {
-       pointer<entry> e = alloc.allocate(1);
-       T* p = &(e->value);
+     T *allocate(Args&&... args) {
+       entry *e = alloc.allocate(1);
+       T *p = &(e->value);
        new (p) T(std::forward<Args>(args)...);
        e->next = nullptr;
        return p;
      }
-     //NOTE:We must ensure that we convert pointer<T> to void* using static_cast and not reinterpret_cast. This is
-     //because typecast operator may be overloaded (like in offset_ptr) in some cases.
-     void push(pointer<T> p) {
-       pointer<entry> e = reinterpret_cast<entry*>(static_cast<uint8_t*>(static_cast<void*>(p)) - offsetof(entry, value));
+
+     void push(T *p) {
+       entry *e = reinterpret_cast<entry*>(reinterpret_cast<uint8_t*>(p) - offsetof(entry, value));
        versioned_head exp = _head;
        do {
          e->next = exp.ptr;
        } while(!_head.compare_exchange_weak(exp, versioned_head(e, exp.version + 1)));
      }
 
-     void push(pointer<T> begin, pointer<T> end) {
-       pointer<entry> b = reinterpret_cast<entry*>(static_cast<uint8_t*>(static_cast<void*>(begin)) - offsetof(entry, value));
-       pointer<entry> e = reinterpret_cast<entry*>(static_cast<uint8_t*>(static_cast<void*>(end)) - offsetof(entry, value));
+     void push(T *begin, T *end) {
+       entry *b = reinterpret_cast<entry*>(reinterpret_cast<uint8_t*>(begin) - offsetof(entry, value));
+       entry *e = reinterpret_cast<entry*>(reinterpret_cast<uint8_t*>(end) - offsetof(entry, value));
        versioned_head exp = _head;
        do {
          e->next = exp.ptr;
        } while(!_head.compare_exchange_weak(exp, versioned_head(b, exp.version + 1)));
      }
 
-     void pop(pointer<T> &ret) {
+     void pop(T *&ret) {
        versioned_head exp = _head;
        while (exp.ptr) {
          ret = &(exp.ptr->value);
@@ -146,8 +134,8 @@ namespace ruts {
        ret = nullptr;
      }
 
-     void deallocate(pointer<T> e) {
-       alloc.deallocate(reinterpret_cast<entry*>(static_cast<uint8_t*>(static_cast<void*>(e)) - offsetof(entry, value)), 1);
+     void deallocate(T *e) {
+       alloc.deallocate(reinterpret_cast<entry*>(reinterpret_cast<uint8_t*>(e) - offsetof(entry, value)), 1);
      }
   };
 }

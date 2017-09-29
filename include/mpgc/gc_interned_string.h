@@ -106,7 +106,7 @@ namespace mpgc {
     return os;
   }
 
-  template <std::size_t Segments=10>
+  template <typename Traits = gc_cm_traits>
   class gc_interned_string_table : public gc_allocated {
   public:
     using char_type = char16_t;
@@ -119,7 +119,7 @@ namespace mpgc {
 
     using value_type = gc_ptr<const keyed_string_type>;
   private:
-    using map_type = gc_cuckoo_map<key_type, value_type, ruts::hash1<key_type>, ruts::hash2<key_type>, Segments>;
+    using map_type = gc_cuckoo_map<key_type, value_type, Traits>;
     const gc_ptr<map_type> _map;
 
 

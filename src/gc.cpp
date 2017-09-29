@@ -34,8 +34,6 @@
 #include <mutex>
 #include <cassert>
 #include <cstdlib>
-#include <iostream>
-#include <cerrno>
 
 #include <sys/mman.h>
 #include <sys/types.h>
@@ -89,68 +87,29 @@ namespace mpgc {
   uint8_t* base_offset_ptr::_heap_end = nullptr;
   std::size_t base_offset_ptr::_heap_size = 0;
 
-  gc_control_block *cblock = nullptr;
+  static gc_control_block *cblock = nullptr;
 
   void initialize() {
     static std::once_flag done;
     std::call_once(done, [] {
       int fd = open(gc_heap_file().data(), O_RDWR, S_IRUSR | S_IWUSR);
-      if (fd == -1) {
-        std::cout << "Could not open heap file '" << gc_heap_file() << "': "
-                  << std::strerror(errno) << std::endl;
-        assert(fd != -1);
-      }
+      assert(fd != -1);
       struct stat st;
       int ret = fstat(fd, &st);
-      if (ret != 0) {
-        std::cout << "Could not stat heap file '" << gc_heap_file() << "': "
-                  << std::strerror(errno) << std::endl;
-        assert(ret == 0);
-      }
+      assert(ret == 0);
 
       uint8_t* p = static_cast<uint8_t*>(mmap(nullptr, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
       close(fd);
-      if (p == MAP_FAILED) {
-        std::cout << "Map of heap file '" << gc_heap_file() << "' failed: "
-                  << std::strerror(errno) << std::endl;
+      if (p == MAP_FAILED)
         std::abort();
-      }
 
       base_offset_ptr::initialize(p, st.st_size);
-      //gc_control_block &block = ruts::managed_space::find_or_construct<gc_control_block>(42, p, st.st_size);
-      //gc_allocator::initialize(st.st_size, block.global_free_list);
-      cblock = reinterpret_cast<gc_control_block*>(p);
+      gc_control_block &block = ruts::managed_space::find_or_construct<gc_control_block>(42, p, st.st_size);
+      gc_allocator::initialize(st.st_size, block.global_free_list);
+      cblock = &block;
       gc_handshake::initialize1();
     });
     gc_handshake::initialize2();
-  }
-
-  void init_on_createheap() {
-      int fd = open(gc_heap_file().data(), O_RDWR, S_IRUSR | S_IWUSR);
-      if (fd == -1) {
-        std::cout << "Could not open heap file '" << gc_heap_file() << "': "
-                  << std::strerror(errno) << std::endl;
-        assert(fd != -1);
-      }
-      struct stat st;
-      int ret = fstat(fd, &st);
-      if (ret != 0) {
-        std::cout << "Could not stat heap file '" << gc_heap_file() << "': "
-                  << std::strerror(errno) << std::endl;
-        assert(ret == 0);
-      }
-
-      uint8_t* p = static_cast<uint8_t*>(mmap(nullptr, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0));
-      close(fd);
-      if (p == MAP_FAILED) {
-        std::cout << "Map of heap file '" << gc_heap_file() << "' failed: "
-                  << std::strerror(errno) << std::endl;
-        std::abort();
-      }
-
-      base_offset_ptr::initialize(p, st.st_size);
-
-      cblock = new (p) gc_control_block(st.st_size, p + sizeof(gc_control_block));
   }
 
   gc_control_block &control_block() {
@@ -159,7 +118,5 @@ namespace mpgc {
     return b;
   }
 
-  std::size_t gc_mem_stats::n_processes() const {
-    return cblk->total_process_count.load().count;
-  }
+
 }

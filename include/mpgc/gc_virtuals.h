@@ -39,13 +39,6 @@
 namespace mpgc {
 
 
-  template <typename Root>
-  inline
-  const void init_vf_table_for(typename Root::vf_table &table) {
-    Root::init_vf_table(table);
-  }
-
-
 
   /*
    * GC-allocated objects (at least when the GC heap is in NVM) aren't
@@ -115,7 +108,7 @@ namespace mpgc {
       template <typename T>
       void bind(discriminator_type disc = T::discrim) {
 	std::size_t index = static_cast<std::size_t>(disc);
-	if (_rep.size() <= index) {
+	if (_rep.size() < index) {
 	  _rep.resize(index+1);
 	}
 	_rep[index] = [](const ct_func_type &ct) {
@@ -127,12 +120,13 @@ namespace mpgc {
   protected:
     
 
+    static void init_vf_table(vf_table &); 
+
     static vf_table &vtbl() {
       static vf_table t;
       static std::once_flag initialized;
       std::call_once(initialized, []() {
-          //          Root::init_vf_table(t);
-          init_vf_table_for<Root>(t);
+	  init_vf_table(t);
 	});
       return t;
     }

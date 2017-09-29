@@ -34,6 +34,7 @@
 #ifndef GC_CUCKOO_MAP_H_
 #define GC_CUCKOO_MAP_H_
 
+#if 0
 #include <cstdint>
 #include <random>
 #include <atomic>
@@ -41,14 +42,219 @@
 #include <utility>
 #include <cassert>
 #include <random>
+#endif
 
 #include "mpgc/gc.h"
+#include "ruts/cuckoo_map.h"
+
+#if 0
+
 #include "ruts/bit_field.h"
 #include "ruts/meta.h"
 #include "ruts/hashes.h"
 #include "ruts/cas_loop.h"
+#endif
 
 namespace mpgc {
+
+  struct gc_cm_traits : ruts::default_cm_traits {
+    // dummy allocator
+    template <typename T>
+    struct alloc_type {
+      alloc_type() {}
+      template <typename U> alloc_type(alloc_type<U>) {}
+    };
+
+    template <typename T>
+    using pointer = gc_ptr<T>;
+
+    template <typename T, std::size_t NFlags=0>
+    using v_pointer = versioned_gc_ptr<T,NFlags>;
+    template <typename T, std::size_t NFlags=0>
+    using av_pointer = atomic_versioned_gc_ptr<T,NFlags>;
+
+    template <typename T, typename ...Args>
+    static pointer<T> create(alloc_type<T> &alloc, Args&&...args) {
+      return make_gc<T>(std::forward<Args>(args)...);
+    }
+
+    template <typename T>
+    static void destroy(alloc_type<T> &alloc, const pointer<T> &s) {
+      // just drop on the floor
+    }
+
+    class base_type : public gc_allocated {
+    protected:
+      using ctor_arg_type = gc_token&;
+      base_type(gc_token &gc) : gc_allocated{gc} {}
+      
+      template <typename T>
+      static pointer<T> this_as_pointer(T *self) {
+        return this_as_gc_ptr(self);
+      }
+    };
+
+    /*
+     * In the descriptor functions, we don't mention the specific base
+     * as a super, because that would negate the trick we're using to
+     * allow the actual class to inherit the descriptor() function.
+     */
+
+    template <typename MT>
+    struct map_base : base_type {
+      map_base(gc_token &gc) : base_type{gc} {}
+
+      static const auto &descriptor() {
+        static gc_descriptor d =
+          GC_DESC(MT)
+          .template WITH_SUPER(base_type)
+          .template WITH_FIELD(&MT::_table_alloc)
+          .template WITH_FIELD(&MT::_left_table)
+          .template WITH_FIELD(&MT::_right_table)
+          .template WITH_FIELD(&MT::_entry_alloc)
+          ;
+        return d;
+      }
+    };
+
+    template <typename TT>
+    struct table_base : base_type {
+      table_base(gc_token &gc) : base_type{gc} {}
+
+      static const auto &descriptor() {
+        static gc_descriptor d =
+	  GC_DESC(TT)
+          .template WITH_SUPER(base_type)
+	  .template WITH_FIELD(&TT::_map)
+	  .template WITH_FIELD(&TT::_side)
+	  .template WITH_FIELD(&TT::_hash)
+	  .template WITH_FIELD(&TT::_segments);
+        return d;
+      }
+
+    };
+
+    template <typename ST>
+    struct segment_base : base_type {
+      segment_base(gc_token &gc) : base_type{gc} {}
+
+      static const auto &descriptor() {
+        static gc_descriptor d =
+	  GC_DESC(ST)
+          .template WITH_SUPER(base_type)
+	  .template WITH_FIELD(&ST::_num)
+	  .template WITH_FIELD(&ST::_table)
+	  .template WITH_FIELD(&ST::_hash)
+	  .template WITH_FIELD(&ST::_slot_bits)
+	  .template WITH_FIELD(&ST::_size)
+	  .template WITH_FIELD(&ST::_mask)
+	  .template WITH_FIELD(&ST::_alloc)
+	  .template WITH_FIELD(&ST::_slots)
+	  .template WITH_FIELD(&ST::_replacement)
+	  .template WITH_FIELD(&ST::_next_to_migrate);
+        return d;
+      }
+      
+    };
+
+    template <typename ET>
+    struct entry_base : base_type {
+      entry_base(gc_token &gc) : base_type{gc} {}
+
+      static const auto &descriptor() {
+        static gc_descriptor d =
+	  GC_DESC(ET)
+          .template WITH_SUPER(base_type)
+	  .template WITH_FIELD(&ET::key)
+	  .template WITH_FIELD(&ET::val)
+          ;
+        return d;
+      }
+      
+    };
+
+    template <typename SHT>
+    struct switched_hash_base {
+      static const auto &descriptor() {
+	static gc_descriptor d =
+	  GC_DESC(SHT)
+	  .template WITH_FIELD(&SHT::hash1)
+	  .template WITH_FIELD(&SHT::hash2)
+	  .template WITH_FIELD(&SHT::use_hash1);
+	return d;
+      }
+    };
+
+    template <typename T>
+    struct _array_base
+    {
+      gc_array_ptr<T> _slots;
+
+      _array_base(std::size_t n) : _slots{n} {}
+
+      operator const gc_array_ptr<T> &() const {
+        return _slots;
+      }
+
+      static const auto &descriptor() {
+	static gc_descriptor d =
+	  GC_DESC(_array_base)
+	  .template WITH_FIELD(&_array_base::_slots)
+          ;
+	return d;
+      }
+
+      auto &operator[](std::size_t i) const {
+        return _slots[i];
+      }
+
+      auto begin() {
+        return _slots.begin();
+      }
+      
+      auto begin() const {
+        return _slots.begin();
+      }
+      
+      auto end() {
+        return _slots.end();
+      }
+      
+      auto end() const {
+        return _slots.end();
+      }
+      
+    };
+
+    template <typename T>
+    struct array_type : _array_base<T> {
+      array_type(std::size_t size, const alloc_type<T> &)
+        : _array_base<T>{size}
+      {}
+    };
+
+    template <typename T, std::size_t N>
+    struct static_array_type : _array_base<T>
+    {
+      static_array_type()
+        : _array_base<T>{N}
+      {}
+    };
+
+
+  };
+
+
+  struct small_gc_cm_traits : ruts::small_cm_traits<gc_cm_traits>
+  {};
+
+  template <typename K, typename V, typename Traits = gc_cm_traits>
+  using gc_cuckoo_map = ruts::cuckoo_map<K,V,Traits>;
+
+  template <typename K, typename V, typename Traits = gc_cm_traits>
+  using small_gc_cuckoo_map = ruts::small_cuckoo_map<K,V,Traits>;
+
+#if 0  
 
   template <std::size_t Cap, std::size_t Bits, std::size_t Size, typename Enable = void> struct __bits_needed;
 
@@ -1020,10 +1226,10 @@ namespace mpgc {
       pointer<entry_type> e = find(key);
       if (e == nullptr) {
         // if it's not there, we can't replace
-        return replace_return(false, false, value_type{}, value_type{});
+        return replace_return(false, false, value_type {});
       }
       auto clrv = ruts::try_change_value(e->val, expected, val);
-      return replace_return(clrv, true, clrv.prior_value, clrv.resulting_value());
+      return replace_return(clrv, true, clrv.prior_value);
     }
 
     class reference {
@@ -1186,7 +1392,7 @@ namespace mpgc {
   constexpr typename gc_cuckoo_map<K,V,Hash1,Hash2,SegBits>::entry_ptr_type::template flag_id<1>
   gc_cuckoo_map<K,V,Hash1,Hash2,SegBits>::frozen;
 
-
+#endif
 }
 
 

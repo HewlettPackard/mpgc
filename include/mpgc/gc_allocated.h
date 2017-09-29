@@ -34,17 +34,8 @@
 #include "mpgc/gc_desc.h"
 
 namespace mpgc {
-  namespace gc_handshake {
-    struct in_memory_thread_struct;
-  }
-  extern void install_descriptor_epilogue(gc_descriptor&);
-
-  namespace gc_allocator {
-    class bump_allocation_slots;
-  }
   class gc_token {
     friend class gc_allocated;
-    friend class gc_allocator::bump_allocation_slots;
     template <typename T> friend class gc_allocator__;
     const gc_descriptor descriptor;
     explicit gc_token(const gc_descriptor &d)
@@ -56,13 +47,7 @@ namespace mpgc {
   class gc_allocated {
     gc_descriptor _descriptor;
 
-    friend void allocation_epilogue(gc_handshake::in_memory_thread_struct&, void*, gc_token&, std::size_t);
-    //An indicator class to restrict only allocation_epilogue to be able to call the following ctor.
-    class only_allocation_epilogue{};
-    //Only to be called from allocation epilogue.
-    explicit gc_allocated(only_allocation_epilogue, gc_token &gc)
-      : _descriptor(gc_descriptor::install{}, gc.descriptor)
-    {}
+    friend void allocation_epilogue(void*, gc_token&, std::size_t);
     protected:
     /*
      * By requiring a gc_token parameter, we ensure that
@@ -80,8 +65,7 @@ namespace mpgc {
     explicit gc_allocated(gc_token &gc) 
       : _descriptor(gc_descriptor::install{}, gc.descriptor)
     {
-      //assert(_descriptor.is_valid());
-      install_descriptor_epilogue(_descriptor);
+      // assert(_descriptor.is_valid());
     }
   public:
     /*
@@ -93,10 +77,7 @@ namespace mpgc {
     gc_allocated &operator =(const gc_allocated &) = delete;
     gc_allocated &operator =(gc_allocated &) = delete;
 
-    const gc_descriptor& get_gc_descriptor() const {
-      return _descriptor;
-    }
-    gc_descriptor& get_non_const_gc_desc() {
+    const gc_descriptor &get_gc_descriptor() const {
       return _descriptor;
     }
   protected:

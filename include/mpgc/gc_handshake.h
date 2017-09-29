@@ -38,7 +38,6 @@
 #include <vector>
 #include <unordered_set>
 #include <cstdio>
-#include <random>
 
 #include <execinfo.h>
 #include <sys/types.h>
@@ -49,17 +48,16 @@
 #include <pthread.h>
 
 #include "ruts/collections.h"
-#include "ruts/managed.h"
 
 #include "mpgc/mark_buffer.h"
 #include "mpgc/gc_thread.h"
-#include "mpgc/gc_skiplist_allocator.h"
+#include "mpgc/gc_allocator.h"
 
 namespace std {
   extern void cpu_relax();
 }
 namespace mpgc {
-  extern volatile uint8_t request_gc_termination;
+  extern volatile bool request_gc_termination;
   namespace gc_handshake {
     extern void initialize1();
     extern void initialize2();
@@ -114,17 +112,10 @@ namespace mpgc {
         Live
       };
 
-      using on_stack_wp_set_type = std::unordered_set<const void*,
-                                                      std::hash<const void*>,
-                                                      std::equal_to<const void*>,
-                                                      ruts::managed_space::allocator<const void*>>;
-
-      on_stack_wp_set_type on_stack_wp_set;
       gc_allocator::localPoolType local_free_list;
-      std::mt19937 rand;
       const pthread_t pthread;
       uint8_t * const stack_end;
-      mutator_persist * const persist_data;
+      mark_buffer<offset_ptr<const gc_allocated>> * const mbuffer;
       mark_bitmap * const bitmap;
       std::atomic<gc_status> status_idx;
       std::atomic<Weak_signal> weak_signal;
@@ -150,10 +141,9 @@ namespace mpgc {
       }
 
       in_memory_thread_struct() :
-          rand(pthread),
           pthread(pthread_self()),
-          stack_end(compute_stack_addr(pthread)),
-          persist_data(process_struct->mutator_persist_list().insert()),
+          stack_end(compute_stack_addr()),
+          mbuffer(process_struct->mark_buffer_list().insert()),
           bitmap(mbitmap),
           status_idx(gc_status(Signum::sigInit)),
           weak_signal(Weak_signal::Working),
@@ -166,7 +156,7 @@ namespace mpgc {
       {}
 
       ~in_memory_thread_struct() {
-        persist_data->mbuf.mark_dead();
+        mbuffer->mark_dead();
       }
 
     private:
@@ -175,12 +165,12 @@ namespace mpgc {
        * is first created. The possibility of the stack being
        * grown/shrink at runtime is not supported yet.
        */
-      uint8_t *compute_stack_addr(pthread_t p) {
+      uint8_t *compute_stack_addr() {
         void *stack_addr;
         std::size_t stack_size;
         pthread_attr_t attr;
 
-        pthread_getattr_np(p, &attr);
+        pthread_getattr_np(pthread_self(), &attr);
         pthread_attr_getstack(&attr, &stack_addr, &stack_size);
         pthread_attr_destroy(&attr);
         return reinterpret_cast<uint8_t*>(stack_addr) + stack_size;
@@ -198,7 +188,19 @@ namespace mpgc {
     struct thread_struct_handle {
       in_memory_thread_struct *handle;
 
-      thread_struct_handle();
+      thread_struct_handle() {
+        gc_status expected_status = Signum::sigInit;
+        /* We must ensure that handle is initialzed before thread_struct is inserted
+         * in the thread_struct_list from where the GC thread can pick it up and send
+         * a signal. This ordering ensures that the application thread is ready to
+         * receive signals before GC thread can do so.
+         * Therefore, we pass a reference to handle in the insert() function and
+         * initialize it there after construction.
+         */
+        thread_struct_list.insert(handle);
+        // We must set status_idx only if we haven't received a signal by that time.
+        handle->status_idx.compare_exchange_strong(expected_status, process_struct->get_gc_status());
+      }
 
       ~thread_struct_handle() { handle->mark_dead(); }
     };

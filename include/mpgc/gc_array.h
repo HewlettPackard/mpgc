@@ -128,10 +128,9 @@ public:
       {}
 
       static const auto &descriptor() {
-	static gc_descriptor d =
+	gc_descriptor d =
 	  GC_DESC(iter_)
-	  .template WITH_FIELD(&iter_::_array)
-          .template WITH_FIELD(&iter_::_index);
+	  .template WITH_FIELD(&iter_::_array);
         return d;
       }
       iter_ &operator =(const iter_ &) = default;

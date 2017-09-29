@@ -54,38 +54,119 @@ namespace ruts {
 
   template <std::size_t Cap, std::size_t Bits, std::size_t Size, typename Enable = void> struct __bits_needed;
 
-  template <typename K, typename V, typename Hash1=ruts::hash1<K>, typename Hash2=ruts::hash2<K>,
-      std::size_t SegBits = 10, typename Allocator = std::allocator<V>>
-  class cuckoo_map {
-  public:
-    using key_type = K;
-    using value_type = V;
+  struct default_cm_traits {
+    constexpr static std::size_t seg_bits = 10;
+    constexpr static std::size_t default_capacity(std::size_t sb) {
+      return 1 << (sb + 10);
+    }
+    constexpr static std::size_t max_eviction_depth = 8;
 
-    using hash1_fn_type = Hash1;
-    using hash2_fn_type = Hash2;
-    using hash_type = uint64_t;
-
-    //    template <typename T>
-    //    using pointer = T*;
+    template <typename K> using hash1_fn_type = ruts::hash1<K>;
+    template <typename K> using hash2_fn_type = ruts::hash2<K>;
+    class base_type {
+    protected:
+      template <typename T>
+      static T *this_as_pointer(T *self) {
+        return self;
+      }
+    };
+    template <typename MT> struct map_base : base_type {};
+    template <typename TT> struct table_base : base_type {};
+    template <typename ST> struct segment_base : base_type {};
+    template <typename ET> struct entry_base : base_type {};
+    template <typename SHT> struct switched_hash_base {};
+  };
+  
+  template <template <typename T> class A>
+  struct alloc_cm_traits : default_cm_traits
+  {
+    template <typename T> using alloc_type = A<T>;
     template <typename T>
     using pointer
     = std::conditional_t<std::is_const<T>::value,
-                         typename std::allocator_traits<Allocator>
-                         ::template rebind_alloc<std::remove_const_t<T>>
+                         typename std::allocator_traits<alloc_type<std::remove_const_t<T> > >
                          ::const_pointer,
-                         typename std::allocator_traits<Allocator>
-                         ::template rebind_alloc<std::remove_const_t<T>>
+                         typename std::allocator_traits<alloc_type<std::remove_const_t<T> > >
                          ::pointer>;
+    template <typename T>
+    using array_type = runtime_array<T, alloc_type<T>>;
+
+    template <typename T, std::size_t N>
+    using static_array_type = std::array<T,N>;
+
+    template <typename T, typename ...Args>
+    static pointer<T> create(alloc_type<T> &alloc, Args&&...args) {
+      using at_type = std::allocator_traits<alloc_type<T>>;
+      pointer<T> s = at_type::allocate(alloc, 1);
+      T *p = s;
+      at_type::construct(alloc, p, std::forward<Args>(args)...);
+      return s;
+    }
+
+    template <typename T>
+    static void destroy(alloc_type<T> &alloc, const pointer<T> &s) {
+      using at_type = std::allocator_traits<alloc_type<T>>;
+      T *p = s;
+      at_type::destroy(alloc, p);
+      at_type::deallocate(alloc, s, 1);
+    }
+
     template <typename T, std::size_t NFlags=0>
     using v_pointer = versioned<pointer<T>,NFlags>;
     template <typename T, std::size_t NFlags=0>
     using av_pointer = atomic_versioned<pointer<T>,NFlags>;
 
+
+  };
+
+  struct std_alloc_cm_traits : alloc_cm_traits<std::allocator>
+  {
+  };
+
+  
+
+  template <typename K, typename V, typename Traits = std_alloc_cm_traits>
+  class cuckoo_map : public Traits::template map_base<cuckoo_map<K,V,Traits>> {
+  public:
+    using key_type = K;
+    using value_type = V;
+
+    using traits_type = Traits;
+
+    using hash1_fn_type = typename traits_type::template hash1_fn_type<key_type>;
+    using hash2_fn_type = typename traits_type::template hash2_fn_type<key_type>;
+    using hash_type = uint64_t;
+
+    template <typename T> using pointer = typename traits_type::template pointer<T>;
+    template <typename T> using alloc_type = typename traits_type::template alloc_type<T>;
+
+    template <typename T, std::size_t NFlags=0>
+      using v_pointer = typename traits_type::template v_pointer<T,NFlags>;
+    template <typename T, std::size_t NFlags=0>
+      using av_pointer = typename traits_type::template av_pointer<T,NFlags>;
+
+
   private:
-    struct entry_type {
+    using map_base = typename traits_type::template map_base<cuckoo_map>;
+    friend map_base;
+    
+    struct entry_type : public traits_type::template entry_base<entry_type> {
+      using entry_base = typename traits_type::template entry_base<entry_type>;
+      friend entry_base;
+
       const key_type key;
       std::atomic<value_type> val;
-      entry_type (const key_type &k, const value_type &v) : key{k}, val{v} {}
+      
+
+      template <typename B=entry_base,
+                typename = std::enable_if_t<!std::is_default_constructible<B>::value> >
+      entry_type(typename B::ctor_arg_type _extra,
+                 const key_type &k, const value_type &v)
+        : entry_base{_extra}, key{k}, val{v} {}
+
+      template <typename B=entry_base,
+                typename = std::enable_if_t<std::is_default_constructible<B>::value> >
+      entry_type(const key_type &k, const value_type &v) : key{k}, val{v} {}
     };
 
     constexpr static std::size_t num_flags = 2;
@@ -101,21 +182,19 @@ namespace ruts {
      */
     constexpr static typename entry_ptr_type::template flag_id<1> frozen{};
 
-
-    using entry_alloc_type = meta::rebind_alloc_t<Allocator, entry_type>;
-    using atomic_entry_ptr_alloc_type = meta::rebind_alloc_t<Allocator, atomic_entry_ptr_type>;
-
     constexpr static std::size_t n_tables = 2;
-    constexpr static std::size_t n_seg_bits = SegBits;
-    constexpr static std::size_t max_eviction_depth = 8;
-    constexpr static std::size_t default_initial_segment_bits = 10;
+    constexpr static std::size_t n_seg_bits = traits_type::seg_bits;
+    constexpr static std::size_t max_eviction_depth = traits_type::max_eviction_depth;
     constexpr static std::size_t max_segment_slot_bits = 64-n_seg_bits;
-    constexpr static std::size_t default_cap = 1 << (n_seg_bits + default_initial_segment_bits);
+    constexpr static std::size_t default_cap = traits_type::default_capacity(n_seg_bits);
 
     enum class side { LEFT, RIGHT };
 
 
-    class switched_hash {
+    class switched_hash : public traits_type::template switched_hash_base<switched_hash> {
+      using switched_hash_base = typename traits_type::template switched_hash_base<switched_hash>;
+      friend switched_hash_base;
+      
       const hash1_fn_type hash1;
       const hash2_fn_type hash2;
       const bool use_hash1;
@@ -191,16 +270,19 @@ namespace ruts {
 
     class source_grew {};
 
-    class segment {
-      using slot_array_type = ruts::runtime_array<atomic_entry_ptr_type, atomic_entry_ptr_alloc_type>;
+    class segment : public traits_type::template segment_base<segment> {
+      using segment_base = typename traits_type::template segment_base<segment>;
+      friend segment_base;
+      
+      using slot_array_type = typename traits_type::template array_type<atomic_entry_ptr_type>;
 
       const std::size_t _num;
-      table &_table;
-      switched_hash _hash = _table._hash;
+      const pointer<table> _table;
+      switched_hash _hash = _table->_hash;
       const std::size_t _slot_bits;
       const std::size_t _size = (std::size_t{1} << _slot_bits);
       const std::size_t _mask = _size-1;
-      atomic_entry_ptr_alloc_type _alloc;
+      mutable alloc_type<segment> _alloc;
       slot_array_type _slots{_size, _alloc};
       std::atomic<pointer<segment>> _replacement{nullptr};
       mutable std::atomic<std::size_t> _next_to_migrate{0};
@@ -208,17 +290,30 @@ namespace ruts {
       friend class table;
       friend class cuckoo_map;
 
+      pointer<segment> this_pointer() {
+        return segment_base::this_as_pointer(this);
+      }
+
+      pointer<const segment> this_pointer() const {
+        return segment_base::this_as_pointer(this);
+      }
+
+      pointer<segment> nc_this_pointer() const {
+        segment *nc_this = const_cast<segment *>(this);
+        return segment_base::this_as_pointer(nc_this);
+      }
+
       /*constexpr*/ std::size_t slot_index(hash_type hash) const {
         return hash & _mask;
       }
 
       slot_ref slot(hash_type hash) {
         std::size_t i = slot_index(hash);
-        return slot_ref(this, i, _slots[i]);
+        return slot_ref(this_pointer(), i, _slots[i]);
       }
       slot_const_ref slot(hash_type hash) const {
         std::size_t i = slot_index(hash);
-        return slot_const_ref(this, i, _slots[i]);
+        return slot_const_ref(this_pointer(), i, _slots[i]);
       }
 
       slot_ref slot(const key_type &key) {
@@ -237,7 +332,7 @@ namespace ruts {
       }
 
       bool replace_null(const pointer<entry_type> &with, hash_type hash) {
-        atomic_entry_ptr_type &s = *slot(hash);
+        slot_ref s = slot(hash);
 
         auto guard = [=](const entry_ptr_type &ep) {
           return ep == nullptr && !ep[frozen];
@@ -247,7 +342,7 @@ namespace ruts {
           return ep.inc_and_set(with);
         };
 
-        auto ur = s.try_update(1, guard, change);
+        auto ur = s->try_update(1, guard, change);
         //  we don't want to succeed if the blocker points to the
         //  same value, because that's indicative of a "locked entry"
         //  due to a process crash immediately following removal of
@@ -303,7 +398,7 @@ namespace ruts {
 	    return true;
 	  }
 	  return (ptr->key == current->key 
-		  && _table._side == side::RIGHT);
+		  && _table->_side == side::RIGHT);
         };
 
         auto change = [=](entry_ptr_type ep) {
@@ -335,12 +430,12 @@ namespace ruts {
         // now, we're going to punt, which may result in more work being done than
         // strictly necessary.
         if (sp[frozen]) {
-          _table._map.clear_slot(target, ur.resulting_value(), current->key);
+          _table->_map->clear_slot(target, ur.resulting_value(), current->key);
           throw source_grew{};
         }
         if (sp.pointer() != current) {
           // It was removed, so we need to clear the slot.
-          _table._map.clear_slot(target, ur.resulting_value(), current->key);
+          _table->_map->clear_slot(target, ur.resulting_value(), current->key);
           return false;
         }
         // Now we remove the "moving" flag.
@@ -363,16 +458,16 @@ namespace ruts {
         }
         // We're done moving.  The value is now in both places.
         // Remove it from the source.  If it's not there, it means it was removed.  That's okay.
-        _table._map.clear_slot(source, current, current->key);
+        _table->_map->clear_slot(source, current, current->key);
         return true;
       }
 
 
       void grow(std::size_t by) {
-        pointer<segment> new_seg = _table.create_segment(this, by);
+        pointer<segment> new_seg = traits_type::create(_alloc, this_pointer(), by);
         if (!ruts::try_change_value(_replacement, nullptr, new_seg)) {
           // Somebody else got there first.  That's okay.
-          _table.delete_segment(new_seg);
+          traits_type::destroy(_alloc, new_seg);
         }
         help_with_grow();
         // At the end it will be installed.
@@ -416,7 +511,7 @@ namespace ruts {
         }
         // Now everything has been moved.  We might be the first to have finished (or the
         // one who was might have died before installing), so we'll try to install.
-        cas_loop_return_value<pointer<segment>> install_res = try_change_value(_table._segments[_num], nc_this, r);
+        cas_loop_return_value<pointer<segment>> install_res = try_change_value(_table->_segments[_num], nc_this_pointer(), r);
         // If that failed, somebody else got there first... and we might even have grown
         // again.  But that's okay.  We've completed this grow.
         // Even if it succeeded, we can't delete the old one yet, because others are using it.
@@ -427,7 +522,11 @@ namespace ruts {
       }
 
     public:
-      explicit segment(std::size_t n, std::size_t slot_bits, atomic_entry_ptr_alloc_type alloc, table &t)
+      template <typename B=segment_base,
+                typename = std::enable_if_t<std::is_default_constructible<B>::value> >
+      segment(std::size_t n, std::size_t slot_bits,
+              const alloc_type<segment> &alloc,
+              const pointer<table> &t)
       : _num(n),
         _table(t),
         _slot_bits(slot_bits),
@@ -435,11 +534,41 @@ namespace ruts {
       {
       }
 
-      explicit segment(const pointer<segment> &prior, std::size_t plus_bits)
+      template <typename B=segment_base,
+                typename = std::enable_if_t<!std::is_default_constructible<B>::value> >
+      segment(typename B::ctor_arg_type _extra,
+              std::size_t n, std::size_t slot_bits,
+              const alloc_type<segment> &alloc,
+              const pointer<table> &t)
+        : segment_base{_extra},
+          _num(n),
+        _table(t),
+        _slot_bits(slot_bits),
+        _alloc(alloc)
+      {
+      }
+
+      template <typename B=segment_base,
+                typename = std::enable_if_t<std::is_default_constructible<B>::value> >
+      segment(const pointer<segment> &prior, std::size_t plus_bits)
       : segment(prior->_num,
                 prior->_slot_bits+plus_bits,
                 prior->_alloc,
                 prior->_table)
+      {
+//        std::cerr << "--- Growing segment " << prior << " (" << prior->_slot_bits << ") "
+//            << "into " << this << " (" << _slot_bits << ")." << std::endl;
+      }
+
+      template <typename B=segment_base,
+                typename = std::enable_if_t<!std::is_default_constructible<B>::value> >
+      segment(typename B::ctor_arg_type _extra,
+              const pointer<segment> &prior, std::size_t plus_bits)
+        : segment(_extra,
+                  prior->_num,
+                  prior->_slot_bits+plus_bits,
+                  prior->_alloc,
+                  prior->_table)
       {
 //        std::cerr << "--- Growing segment " << prior << " (" << prior->_slot_bits << ") "
 //            << "into " << this << " (" << _slot_bits << ")." << std::endl;
@@ -462,7 +591,7 @@ namespace ruts {
 
 
       bool remove(const key_type &key, hash_type hash) {
-        atomic_entry_ptr_type &s = *slot(hash);
+        slot_ref s = slot(hash);
         entry_ptr_type ep = s.contents();
         while (true) {
           if (ep[frozen]) {
@@ -470,10 +599,10 @@ namespace ruts {
             return new_seg->remove(key, hash);
           }
           pointer<entry_type> e = ep.pointer();
-          if (e == nullptr || e->key != key) {
-            return false;
-          }
-	  auto ur = s.change_using(ep, inc_and_clear_value);
+	  if (e == nullptr || e->key != key) {
+	    return false;
+	  }
+	  auto ur = s->change_using(ep, inc_and_clear_value);
 	  if (ur) {
 	    return true;
 	  }
@@ -510,7 +639,7 @@ namespace ruts {
             if (b < resulting_size || g > growth) {
               resulting_size = b;
               growth = g;
-              best = this;
+              best = this_pointer();
             }
             return;
           }
@@ -521,101 +650,113 @@ namespace ruts {
 
     };
 
-    using segment_alloc_type = meta::rebind_alloc_t<Allocator, segment>;
-
-
-    class table {
+    class table : public traits_type::template table_base<table> {
+      using table_base = typename traits_type::template table_base<table>;
+      friend table_base;
+      
       static const std::size_t n_segments = 1 << n_seg_bits;
 
-      cuckoo_map &_map;
+      const pointer<cuckoo_map> _map;
       const side _side;
       const switched_hash _hash;
-      std::array<std::atomic<pointer<segment>>, n_segments> _segments;
-      table &_other_side = _map.other_table(_side);
-      mutable segment_alloc_type _seg_alloc;
+      typename traits_type::template static_array_type<std::atomic<pointer<segment>>,n_segments> _segments;
+      //      std::array<std::atomic<pointer<segment>>, n_segments> _segments;
 
-      const segment &find_segment(hash_type hash) const {
+      pointer<const segment> find_segment(hash_type hash) const {
         std::size_t seg_num = left_bit_field(hash, n_seg_bits);
         pointer<const segment> sp = _segments[seg_num].load();
-        return *sp;
+        return sp;
       }
-      segment &find_segment(hash_type hash) {
+      pointer<segment> find_segment(hash_type hash) {
         std::size_t seg_num = left_bit_field(hash, n_seg_bits);
-        return *(_segments[seg_num].load());
+        return _segments[seg_num];
       }
 
       friend class segment;
       friend class cuckoo_map;
-    public:
-      template <typename ...Args>
-      pointer<segment>
-      create_segment(Args&&...args) const{
-        pointer<segment> s = _seg_alloc.allocate(1);
-        _seg_alloc.construct(s, std::forward<Args>(args)...);
-        return s;
+
+      pointer<table> this_pointer() {
+        return table_base::this_as_pointer(this);
       }
 
-      void
-      delete_segment(const pointer<segment> &s) const {
-        _seg_alloc.destroy(s);
-        _seg_alloc.deallocate(s, 1);
-      }
-
-      explicit table(cuckoo_map &m, side s, const hash1_fn_type &hash1, const hash2_fn_type hash2, std::size_t seg_slot_bits, Allocator a) :
-      _map(m), _side(s), _hash(s, hash1, hash2), _seg_alloc(segment_alloc_type{a})
-      {
+      void initialize(alloc_type<segment> &a, std::size_t seg_slot_bits) {
         int n = 0;
         for (auto &p : _segments) {
-          p = create_segment(n++, seg_slot_bits, atomic_entry_ptr_alloc_type{a}, *this);
+          p = traits_type::create(a, n++, seg_slot_bits, a, this_pointer());
         }
+      }
+    public:
 
+
+      template <typename B=table_base,
+                typename = std::enable_if_t<std::is_default_constructible<B>::value> >
+      explicit table(const pointer<cuckoo_map> &m, side s,
+                     const hash1_fn_type &hash1, const hash2_fn_type hash2,
+                     std::size_t seg_slot_bits,
+                     alloc_type<segment> a)
+        : _map(m), _side(s), _hash(s, hash1, hash2)
+      {
+        initialize(a, seg_slot_bits);
       }
 
-      table &other_side() const {
-        return _other_side;
+      template <typename B=table_base,
+                typename = std::enable_if_t<!std::is_default_constructible<B>::value> >
+      explicit table(typename B::ctor_arg_type _extra,
+                     const pointer<cuckoo_map> &m, side s,
+                     const hash1_fn_type &hash1, const hash2_fn_type hash2,
+                     std::size_t seg_slot_bits,
+                     alloc_type<segment> a)
+        : table_base{_extra}, _map(m), _side(s), _hash(s, hash1, hash2)
+      {
+        initialize(a, seg_slot_bits);
+      }
+
+      pointer<table> other_side() const {
+        return _map->other_table(_side);
       }
 
       slot_ref slot(const key_type &key) {
         hash_type hash = _hash(key);
-        segment &seg = find_segment(hash);
-        return seg.slot(hash);
+        pointer<segment> seg = find_segment(hash);
+        return seg->slot(hash);
       }
 
       pointer<entry_type> find(const key_type &key) const {
         hash_type hash = _hash(key);
-        const segment &seg = find_segment(hash);
-        return seg.find(key, hash);
+        pointer<const segment> seg = find_segment(hash);
+        return seg->find(key, hash);
       }
 
       bool remove(const key_type &key) {
         hash_type hash = _hash(key);
-        segment &seg = find_segment(hash);
-        return seg.remove(key, hash);
+        pointer<segment> seg = find_segment(hash);
+        return seg->remove(key, hash);
       }
       bool replace_null(const pointer<entry_type> &with) {
         hash_type hash = _hash(with->key);
-        segment &seg = find_segment(hash);
-        return seg.replace_null(with, hash);
+        pointer<segment> seg = find_segment(hash);
+        return seg->replace_null(with, hash);
       }
 
     };
 
-    table _left_table;
-    table _right_table;
-    mutable entry_alloc_type _entry_alloc;
+    alloc_type<table> _table_alloc;
+    const pointer<table> _left_table;
+    const pointer<table> _right_table;
+    mutable alloc_type<entry_type> _entry_alloc;
 
-    table &table_on(side s) {
+    pointer<table> table_on(side s) {
       return s == side::LEFT ? _left_table : _right_table;
     }
 
-    table &other_table(side s) {
+    pointer<table> other_table(side s) {
       return s == side::RIGHT ? _left_table : _right_table;
     }
 
     pointer<entry_type> find(const key_type &key) const {
-      pointer<entry_type> e = _left_table.find(key);
+      pointer<entry_type> e = _left_table->find(key);
       if (e == nullptr) {
-        e = _right_table.find(key);
+        e = _right_table->find(key);
       }
       return e;
     }
@@ -653,11 +794,11 @@ namespace ruts {
           throw source_grew{};
         }
 
-        slot_ref left_target = _right_table.slot(left_current->key);
+        slot_ref left_target = _right_table->slot(left_current->key);
         if (left_target.seg->accept_move(left_source, left_current, left_target)) {
           return side::LEFT;
         }
-        slot_ref right_target = _left_table.slot(right_current->key);
+        slot_ref right_target = _left_table->slot(right_current->key);
         if (right_target.seg->accept_move(right_source, right_current, right_target)) {
           return side::RIGHT;
         }
@@ -712,7 +853,7 @@ namespace ruts {
         }
         slot.seg->growth_candidate(key, e->key, best, resulting_size, growth);
         key = e->key;
-        t = &t->other_side();
+        t = t->other_side();
       }
 
     }
@@ -723,9 +864,9 @@ namespace ruts {
       pointer<segment> best = nullptr;
       std::size_t resulting_size = 65;
       std::size_t growth = 0;
-      best_to_grow(&_left_table, key, best, resulting_size, growth);
+      best_to_grow(_left_table, key, best, resulting_size, growth);
       if (best != nullptr) {
-        best_to_grow(&_right_table, key, best, resulting_size, growth);
+        best_to_grow(_right_table, key, best, resulting_size, growth);
       }
       return std::make_pair(best, growth);
     }
@@ -758,8 +899,8 @@ namespace ruts {
 
     void evict_blocker(const key_type &key) {
       while (true) {
-        slot_ref left_slot = _left_table.slot(key);
-        slot_ref right_slot = _right_table.slot(key);
+        slot_ref left_slot = _left_table->slot(key);
+        slot_ref right_slot = _right_table->slot(key);
         try {
           evict_one(left_slot, right_slot, 0, max_eviction_depth);
           return;
@@ -807,14 +948,14 @@ namespace ruts {
     void evict_and_put(const pointer<entry_type> &e, replace_return &rr, GFn &&gfn, UFn &&ufn) {
       // This should eventually succeed.  (Most of the time, the first or second time around)
       while (true) {
-        if (_left_table.replace_null(e)) {
+        if (_left_table->replace_null(e)) {
           rr = replace_return(true, false, value_type(), e->val);
           return;
         }
         // It's possible that somebody else put an entry for the same key
         // in the left table since the last time we looked.  This is okay.  It's as
         // if we wrote first and they overwrote.
-        if (_right_table.replace_null(e)) {
+        if (_right_table->replace_null(e)) {
           rr = replace_return(true, false, value_type(), e->val);
           return;
         }
@@ -824,12 +965,6 @@ namespace ruts {
         }
       }
 
-    }
-
-    pointer<entry_type> new_entry(const key_type &key, const value_type &val) const {
-      pointer<entry_type> e = _entry_alloc.allocate(1);
-      _entry_alloc.construct(e, key, val);
-      return e;
     }
 
 
@@ -843,22 +978,89 @@ namespace ruts {
       return bits;
     }
 
+    pointer<cuckoo_map> this_pointer() {
+      return map_base::this_as_pointer(this);
+    }
+
   public:
-    cuckoo_map(const hash1_fn_type &h1, const hash2_fn_type &h2, std::size_t capacity = default_cap, Allocator alloc = Allocator{}) :
-      _left_table(*this, side::LEFT, h1, h2, slot_bits_for(capacity), alloc),
-      _right_table(*this, side::RIGHT, h1, h2, slot_bits_for(capacity), alloc),
-      _entry_alloc(alloc)
+    template <typename U=value_type,
+              typename B=map_base,
+              typename = std::enable_if_t<std::is_default_constructible<B>::value> >
+    cuckoo_map(const hash1_fn_type &h1, const hash2_fn_type &h2, std::size_t capacity = default_cap,
+               const alloc_type<U> &alloc = alloc_type<U>{})
+      :
+      _table_alloc{alloc},
+      _left_table(traits_type::create(_table_alloc,
+                                      this_pointer(), side::LEFT, h1, h2, slot_bits_for(capacity),
+                                      alloc_type<segment>{alloc})),
+      _right_table(traits_type::create(_table_alloc,
+                                       this_pointer(), side::RIGHT, h1, h2, slot_bits_for(capacity),
+                                       alloc_type<segment>{alloc})),
+      _entry_alloc{alloc}
       {}
 
-      cuckoo_map(const hash1_fn_type &h1, const hash2_fn_type &h2, Allocator alloc) :
-        cuckoo_map(h1, h2, default_cap, alloc)
+    template <typename U=value_type,
+              typename B=map_base,
+              typename = std::enable_if_t<!std::is_default_constructible<B>::value> >
+    cuckoo_map(typename B::ctor_arg_type _extra,
+               const hash1_fn_type &h1, const hash2_fn_type &h2, std::size_t capacity = default_cap,
+               const alloc_type<U> &alloc = alloc_type<U>{})
+      :
+      map_base{_extra},
+      _table_alloc{alloc},
+      _left_table(traits_type::create(_table_alloc,
+                                      this_pointer(), side::LEFT, h1, h2, slot_bits_for(capacity),
+                                      alloc_type<segment>{alloc})),
+      _right_table(traits_type::create(_table_alloc,
+                                       this_pointer(), side::RIGHT, h1, h2, slot_bits_for(capacity),
+                                       alloc_type<segment>{alloc})),
+      _entry_alloc{alloc}
       {}
-    explicit cuckoo_map(std::size_t default_cap, Allocator alloc = Allocator{}) :
-        cuckoo_map{hash1_fn_type{}, hash2_fn_type{}, default_cap, alloc}
+
+    template <typename U=value_type,
+              typename B=map_base,
+              typename = std::enable_if_t<std::is_default_constructible<B>::value> >
+    cuckoo_map(const hash1_fn_type &h1, const hash2_fn_type &h2, const alloc_type<U> &alloc)
+      : cuckoo_map(h1, h2, default_cap, alloc)
+      {}
+
+    template <typename U=value_type,
+              typename B=map_base,
+              typename = std::enable_if_t<!std::is_default_constructible<B>::value> >
+    cuckoo_map(typename B::ctor_arg_type _extra,
+               const hash1_fn_type &h1, const hash2_fn_type &h2, const alloc_type<U> &alloc)
+      : cuckoo_map(_extra, h1, h2, default_cap, alloc)
+      {}
+
+    template <typename U=value_type,
+              typename B=map_base,
+              typename = std::enable_if_t<std::is_default_constructible<B>::value> >
+    explicit cuckoo_map(std::size_t capacity, const alloc_type<U> &alloc = alloc_type<U>{})
+      : cuckoo_map(hash1_fn_type{}, hash2_fn_type{}, capacity, alloc)
     {}
 
-    explicit cuckoo_map(Allocator alloc = Allocator{}) :
-                cuckoo_map{hash1_fn_type{}, hash2_fn_type{}, default_cap, alloc}
+    template <typename U=value_type,
+              typename B=map_base,
+              typename = std::enable_if_t<!std::is_default_constructible<B>::value> >
+    cuckoo_map(typename B::ctor_arg_type _extra,
+               std::size_t capacity, const alloc_type<U> &alloc = alloc_type<U>{})
+      : cuckoo_map(_extra, hash1_fn_type{}, hash2_fn_type{}, capacity, alloc)
+    {}
+
+    template <typename U=value_type,
+              typename B=map_base,
+              typename = std::enable_if_t<std::is_default_constructible<B>::value> >
+    explicit cuckoo_map(const alloc_type<U> &alloc = alloc_type<U>{})
+      : cuckoo_map(default_cap, alloc)
+    {}
+
+
+    template <typename U=value_type,
+              typename B=map_base,
+              typename = std::enable_if_t<!std::is_default_constructible<B>::value> >
+    explicit cuckoo_map(typename B::ctor_arg_type _extra,
+                        const alloc_type<U> &alloc = alloc_type<U>{})
+      : cuckoo_map(_extra, default_cap, alloc)
     {}
 
     bool contains(const key_type &key) const {
@@ -875,8 +1077,8 @@ namespace ruts {
       // temporarily hold values (left shadowing right) with different
       // entries.  Removing the shadowing one first would make the other
       // value reappear.
-      bool res2 = _right_table.remove(key);
-      bool res1 = _left_table.remove(key);
+      bool res2 = _right_table->remove(key);
+      bool res1 = _left_table->remove(key);
       return res1 || res2;
     }
 
@@ -993,7 +1195,7 @@ namespace ruts {
       if (!put_in_existing(key, rr, std::forward<GFn>(guard), std::forward<UFn>(updater))
           && std::forward<GFn>(guard)(false, value_type{}))
         {
-          pointer<entry_type> e = new_entry(key, std::forward<UFn>(updater)(false, value_type{}));
+          pointer<entry_type> e = traits_type::create(_entry_alloc, key, std::forward<UFn>(updater)(false, value_type{}));
           evict_and_put(e, rr, std::forward<GFn>(guard), std::forward<UFn>(updater));
         }
       return rr;
@@ -1158,7 +1360,7 @@ namespace ruts {
     }
 
     reference operator[](const key_type &key) {
-      return reference(this, key);
+      return reference(this_pointer(), key);
     }
 
     value_type operator[](const key_type &key) const {
@@ -1166,7 +1368,7 @@ namespace ruts {
     }
 
     reference at(const key_type &key) {
-      return reference(this, key);
+      return reference(this_pointer(), key);
     }
 
     value_type at(const key_type &key) const {
@@ -1175,42 +1377,26 @@ namespace ruts {
 
   };
 
-
-  template <typename K, typename V, typename Hash1=ruts::hash1<K>, typename Hash2=ruts::hash2<K>,
-      typename Allocator = std::allocator<V>>
-      class small_cuckoo_map : public cuckoo_map<K,V,Hash1,Hash2,0,Allocator>
+  template <typename Traits = std_alloc_cm_traits>
+  struct small_cm_traits : Traits
   {
-    using base = cuckoo_map<K,V,Hash1,Hash2,0,Allocator>;
-    using typename base::hash1_fn_type;
-    using typename base::hash2_fn_type;
-  public:
-    constexpr static std::size_t default_cap = 16;
-    small_cuckoo_map(const hash1_fn_type &h1, const hash2_fn_type &h2, std::size_t capacity = default_cap, Allocator alloc = Allocator{}) :
-      base(h1, h2, default_cap, alloc)
-  {}
-
-    small_cuckoo_map(const hash1_fn_type &h1, const hash2_fn_type &h2, Allocator alloc) :
-        small_cuckoo_map(h1, h2, default_cap, alloc)
-      {}
-    explicit small_cuckoo_map(std::size_t default_cap, Allocator alloc = Allocator{}) :
-        small_cuckoo_map{hash1_fn_type{}, hash2_fn_type{}, default_cap, alloc}
-    {}
-
-    explicit small_cuckoo_map(Allocator alloc = Allocator{})
-    : small_cuckoo_map{hash1_fn_type{}, hash2_fn_type{}, default_cap, alloc}
-    {}
-
-
+    constexpr static std::size_t seg_bits = 0;
+    constexpr static std::size_t default_capacity(std::size_t) {
+      return 16;
+    }
   };
+  
+  template <typename K, typename V, typename Traits = std_alloc_cm_traits>
+  using small_cuckoo_map = cuckoo_map<K, V, small_cm_traits<Traits>>;
 
 
-  template <typename K, typename V, typename Hash1, typename Hash2, std::size_t SegBits, typename Allocator>
-  constexpr typename cuckoo_map<K,V,Hash1,Hash2,SegBits,Allocator>::entry_ptr_type::template flag_id<0>
-  cuckoo_map<K,V,Hash1,Hash2,SegBits,Allocator>::moving;
+  template <typename K, typename V, typename Traits>
+  constexpr typename cuckoo_map<K,V,Traits>::entry_ptr_type::template flag_id<0>
+  cuckoo_map<K,V,Traits>::moving;
 
-  template <typename K, typename V, typename Hash1, typename Hash2, std::size_t SegBits, typename Allocator>
-  constexpr typename cuckoo_map<K,V,Hash1,Hash2,SegBits,Allocator>::entry_ptr_type::template flag_id<1>
-  cuckoo_map<K,V,Hash1,Hash2,SegBits,Allocator>::frozen;
+  template <typename K, typename V, typename Traits>
+  constexpr typename cuckoo_map<K,V,Traits>::entry_ptr_type::template flag_id<1>
+  cuckoo_map<K,V,Traits>::frozen;
 
 
 }

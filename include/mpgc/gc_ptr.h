@@ -1344,7 +1344,7 @@ namespace std {
 
   template <typename T>
   struct versioned_pointer_traits<mpgc::gc_ptr<T>>
-    : default_versioned_pointer_traits<mpgc::gc_ptr<T>>
+    : pointer_traits<mpgc::gc_ptr<T>>
   {
   private:
     using opvpt = versioned_pointer_traits<mpgc::offset_ptr<T>>;
@@ -1358,14 +1358,11 @@ namespace std {
       return opvpt::to_prim_rep(p.as_offset_pointer());
     }
     template <typename M, typename OV, typename NV>
-    static void modify(const void *loc, M&& mod, OV&& old_val, NV&&new_val) {
+    static void modify(M&& mod, OV&& old_val, NV&&new_val) {
       /*
        * old_val() can only be called before mod() is called.
        */
-      mpgc::gc_ptr<T> new_v = forward<NV>(new_val)();
-      mpgc::write_barrier(forward<OV>(old_val)().as_offset_pointer(),
-                          new_v.as_offset_pointer(),
-                          [&new_v, mod=forward<M>(mod)] { return mod(new_v); });
+      mpgc::write_barrier(forward<OV>(old_val)().as_offset_pointer(), forward<NV>(new_val)().as_offset_pointer(), mod);
     }
   };
 

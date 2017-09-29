@@ -121,7 +121,7 @@ advanceProgressBar(const unsigned long current, const unsigned long max,
 class RandomSeed {
   mt19937 generator;
   static unsigned int seed() {
-    static mt19937 s(random_device{}());
+    static mt19937 s(random_device("/dev/random")());
     return s();
   }
 public:

@@ -31,8 +31,9 @@
 using namespace ruts;
 using namespace std;
 
+
 int main() {
-  using string_table_type = interned_string_table<0>;
+  using string_table_type = interned_string_table<small_cm_traits<>>;
   using string_type = typename string_table_type::value_type;
   using map_type = small_cuckoo_map<string_type, size_t>;
 

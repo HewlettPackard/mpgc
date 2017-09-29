@@ -43,7 +43,6 @@
 #include<iomanip>
 #include<cstring>
 #include<string>
-#include<random>
 
 #include "ruts/util.h"
 #include "ruts/runtime_array.h"
@@ -55,7 +54,7 @@
 #include "mpgc/gc_desc.h"
 #include "mpgc/mark_buffer.h"
 #include "mpgc/offset_ptr.h"
-#include "mpgc/gc_skiplist_allocator.h"
+#include "mpgc/gc_allocator.h"
 /*
  * This class contains all the per-process structures.
  */
@@ -63,7 +62,6 @@ namespace mpgc {
   namespace gc_handshake {
     enum class Signum : char;
   }
-
   enum class Stage : unsigned char;
 
   struct status_global_list_idx {
@@ -98,21 +96,9 @@ namespace mpgc {
   };
 
   using Mbuf = mark_buffer<offset_ptr<const gc_allocated>>;
-  struct mutator_persist {
-    Mbuf mbuf;
-    chunk_expansion_slot expansion_slot;
-    gc_allocator::slot_number slot;
-
-    static bool is_marked(mutator_persist *b) {
-      return Mbuf::is_marked(&b->mbuf);
-    }
-    mutator_persist() : mbuf(), slot() {}
-    ~mutator_persist();
-  };
-
-  using Mpersist = mutator_persist;
-  using Mutator_persist_list = ruts::sequential_lazy_delete_collection<mutator_persist, ruts::managed_space::allocator<mutator_persist>>;
+  using Mark_buffer_list = ruts::sequential_lazy_delete_collection<Mbuf, ruts::managed_space::allocator<Mbuf>>;
   using Traversal_queue = work_stealing_wq<offset_ptr<const gc_allocated>>;
+  using Pre_sweep_list = std::deque<std::size_t, ruts::managed_space::allocator<std::size_t>>;
 
   using pcount_t = uint16_t;//any variable which needs to hold process count must use this.
 
@@ -143,20 +129,17 @@ namespace mpgc {
       _info.bstage = s;
     }
 
-    marking_barrier_type(const marking_barrier_type &rhs) noexcept = default;
-    marking_barrier_type(marking_barrier_type &&rhs) noexcept = default;
-    // marking_barrier_type(const marking_barrier_type &rhs) noexcept : _data(rhs._data) {}
-    // marking_barrier_type(marking_barrier_type &&rhs) noexcept : _data(std::move(rhs._data)) {}
+    marking_barrier_type(const marking_barrier_type &rhs) noexcept : _data(rhs._data) {}
+    marking_barrier_type(marking_barrier_type &&rhs) noexcept : _data(std::move(rhs._data)) {}
 
-    marking_barrier_type &operator =(const marking_barrier_type &rhs) noexcept = default;
-    marking_barrier_type &operator =(marking_barrier_type &&rhs) noexcept = default;    // marking_barrier_type &operator =(const marking_barrier_type &rhs) noexcept {
-    //   _data = rhs._data;
-    //   return *this;
-    // }
-    // marking_barrier_type &operator =(marking_barrier_type &&rhs) noexcept {
-    //   _data = std::move(rhs._data);
-    //   return *this;
-    // }
+    marking_barrier_type &operator =(const marking_barrier_type &rhs) noexcept {
+      _data = rhs._data;
+      return *this;
+    }
+    marking_barrier_type &operator =(marking_barrier_type &&rhs) noexcept {
+      _data = std::move(rhs._data);
+      return *this;
+    }
   };
 
   enum struct gc_mutator_weak_sync_state {
@@ -188,42 +171,34 @@ namespace mpgc {
 
   private:
     union {
-      chunk_expansion_slot sweep1_data;
-      std::size_t sweep_nr_chunk;
+      std::size_t sweep_nr_chunk = 0;
       offset_ptr<const gc_allocated> marking_obj_ref;
     };
 
     ruts::atomic16B<liveness> _liveness;
-  public:
-    std::mt19937              rand;
-  private:
-    Barrier_info              _binfo;
-    Mutator_persist_list          _mutator_persist_list;
+    Barrier_info _binfo;
+    Mark_buffer_list _mark_buffer_list;
 
-    Traversal_queue           _tqueue;
+    Traversal_queue _tqueue;
+    Pre_sweep_list  _pre_sweep_list;
 
-    volatile gc_status        _status;
+    volatile gc_status _status;
   public:
 
     std::atomic<uint16_t> gc_mutator_weak_sync;
-    volatile bool        sweep1_enabled;
-
-    chunk_expansion_slot& get_sweep1_data() { return sweep1_data;}
-    chunk_expansion_slot* sweep1_data_ptr() { return &sweep1_data;}
 
    per_process_struct () :
-      sweep1_data(),
       _liveness(liveness(getpid())),
-      rand(_liveness.load().creation_time),
       _tqueue(),
-      sweep1_enabled(false)
+      _pre_sweep_list()
     {
-      static_assert(sizeof(liveness) <= 16, "Liveness object must be at least 16 bytes long.");
+      assert(sizeof(liveness) <= 16);
     }
 
     ~per_process_struct() {
       _tqueue.~Traversal_queue();
-      _mutator_persist_list.~Mutator_persist_list();
+      _pre_sweep_list.~Pre_sweep_list();
+      _mark_buffer_list.~Mark_buffer_list();
     }
 
     void mark_dead() {
@@ -329,16 +304,20 @@ namespace mpgc {
     void set_gc_status(uint16_t d) { _status.data = d;}
     void set_status(gc_handshake::Signum s) { _status.status_idx.status = s;}
 
-    Mutator_persist_list &mutator_persist_list() {
-      return _mutator_persist_list;
+    Mark_buffer_list &mark_buffer_list() {
+      return _mark_buffer_list;
     }
 
     Traversal_queue &traversal_queue() {
       return _tqueue;
     }
 
+    Pre_sweep_list &pre_sweep_list() {
+      return _pre_sweep_list;
+    }
+
     void clear() {
-      _mutator_persist_list.deletion(mutator_persist::is_marked);
+      _mark_buffer_list.deletion(Mbuf::is_marked);
     }
 
     liveness get_liveness() { return _liveness.load();}
@@ -417,12 +396,12 @@ namespace mpgc {
       return rep_t(1) << ((bits_per_value - 1) - bit);
     }
 
-    static constexpr bitmap_idx_t compute_bitmap_index(const std::size_t word_offset) {
-      return word_offset >> value_log_bits;
+    static constexpr bitmap_idx_t compute_bitmap_index(const std::size_t byte_offset) {
+      return byte_offset >> (value_log_bits + 3);//3 for word size
     }
 
-    static bit_number_t compute_bit_number(const std::size_t word_offset) {
-      return word_offset & (bits_per_value - 1);
+    static bit_number_t compute_bit_number(const std::size_t byte_offset) {
+      return (byte_offset >> 3) & (bits_per_value - 1);//3 for word size
     }
 
     void set_sweep_bitmap(atomic_rep_t &word, const rep_t desired, const bool set) {
@@ -462,7 +441,7 @@ namespace mpgc {
       //3 bits for bytes per word, and n bits for bits per rep_t.
       //Each bit represents a word in the heap.
       assert(!(heap_size & ((rep_t(1) << (value_log_bits + 3)) - 1)));
-      return compute_bitmap_index(heap_size >> 3);
+      return compute_bitmap_index(heap_size);
     }
 
     atomic_rep_t &lookup_begin(const bitmap_idx_t idx) {
@@ -487,23 +466,22 @@ namespace mpgc {
       return !(res & desired);
     }
 
-    bool mark_end(const bitmap_idx_t idx, const bit_number_t bit) {
+    void mark_end(const bitmap_idx_t idx, const bit_number_t bit) {
       atomic_rep_t &B = lookup_end(idx);
       rep_t desired = construct_bitmap_word(bit);
-      const rep_t res = B.fetch_or(desired);
-      return !(res & desired);
+      B.fetch_or(desired);
     }
 
-    bool unmark_end(const std::size_t word) {
-      atomic_rep_t &B = lookup_end(compute_bitmap_index(word));
-      rep_t desired = construct_bitmap_word(compute_bit_number(word));
+    bool unmark_end(const std::size_t byte) {
+      atomic_rep_t &B = lookup_end(compute_bitmap_index(byte));
+      rep_t desired = construct_bitmap_word(compute_bit_number(byte));
       const rep_t prev = B.fetch_and(~desired);
       return prev & desired;
     }
 
-    void mark_weak(const std::size_t word) {
-      atomic_rep_t &B = lookup_weak(compute_bitmap_index(word));
-      rep_t desired = construct_bitmap_word(compute_bit_number(word));
+    void mark_weak(const std::size_t byte) {
+      atomic_rep_t &B = lookup_weak(compute_bitmap_index(byte));
+      rep_t desired = construct_bitmap_word(compute_bit_number(byte));
       B.fetch_or(desired);
     }
 
@@ -511,26 +489,20 @@ namespace mpgc {
       return lookup_end(idx) & construct_bitmap_word(bit) ? true : false;
     }
 
-    bool _mark_end_first(const std::size_t beg_word, const std::size_t end_word) {
-      mark_end(compute_bitmap_index(end_word), compute_bit_number(end_word));
-      if (mark_begin(compute_bitmap_index(beg_word), compute_bit_number(beg_word))) {
+    bool _mark_end_first(const std::size_t beg_byte, const std::size_t end_byte) {
+      mark_end(compute_bitmap_index(end_byte), compute_bit_number(end_byte));
+      if (mark_begin(compute_bitmap_index(beg_byte), compute_bit_number(beg_byte))) {
         return true;
       }
       return false;
     }
 
-    bool _mark_begin_first(const std::size_t beg_word, const std::size_t end_word) {
-      mark_begin(compute_bitmap_index(beg_word), compute_bit_number(beg_word));
-      if (mark_end(compute_bitmap_index(end_word), compute_bit_number(end_word))) {
+    bool _mark_begin_first(const std::size_t beg_byte, const std::size_t end_byte) {
+      if (mark_begin(compute_bitmap_index(beg_byte), compute_bit_number(beg_byte))) {
+        mark_end(compute_bitmap_index(end_byte), compute_bit_number(end_byte));
         return true;
       }
       return false;
-    }
-
-    void mark_begin_first(const std::size_t beg_word, const std::size_t end_word) {
-      if (mark_begin(compute_bitmap_index(beg_word), compute_bit_number(beg_word))) {
-        mark_end(compute_bitmap_index(end_word), compute_bit_number(end_word));
-      }
     }
 
     bool is_marked(const bitmap_idx_t idx, const bit_number_t bit) {
@@ -563,8 +535,8 @@ namespace mpgc {
 
     static std::size_t compute_total_bitmap_size(const std::size_t heap_size) {
       std::size_t bitmap_size = compute_bitmap_size(heap_size);
-      std::size_t sweep_bitmap_size = compute_sweep_bitmap_size(compute_logical_chunk_count(bitmap_size));
-      return sizeof(atomic_rep_t) * (bitmap_size * 3 + sweep_bitmap_size * 2);
+      bitmap_size += compute_sweep_bitmap_size(compute_logical_chunk_count(bitmap_size));
+      return bitmap_size * sizeof(atomic_rep_t) * 2;
     }
 
     mark_bitmap(std::size_t heap_size, const Allocator &alloc = Allocator()) :
@@ -582,7 +554,7 @@ namespace mpgc {
   {
       /* TODO: This is too much of work. We have to come up with a way where we don't need to
        * clear all the bitmaps because we can come up with a solution where the bitmaps are
-       * allocated on a new file which is already zero-initialized.
+       * allocated on a new files which are already zero-initialized.
        */
       std::memset(_begin, 0x0, 3 * sizeof(atomic_rep_t) * _size +
                                2 * sizeof(atomic_rep_t) * _sweep_bitmap_size);
@@ -613,42 +585,49 @@ namespace mpgc {
     }
 
     bool is_marked(const offset_ptr<const gc_allocated> &p) {
-      const std::size_t beg_word = p.offset() >> 3;
-      return is_marked(compute_bitmap_index(beg_word), compute_bit_number(beg_word));
+      const std::size_t beg_byte = p.offset();
+      return is_marked(compute_bitmap_index(beg_byte), compute_bit_number(beg_byte));
     }
     //For nullptr we return true. To be used by weak_gc_ptr barriers.
     bool is_marked(const offset_ptr<const gc_allocated> &p, bool check_null) {
-      const std::size_t beg_word = p.offset() >> 3;
-      return (!check_null || beg_word) ? is_marked(compute_bitmap_index(beg_word), compute_bit_number(beg_word)) : true;
+      const std::size_t beg_byte = p.offset();
+      return (!check_null || beg_byte) ? is_marked(compute_bitmap_index(beg_byte), compute_bit_number(beg_byte)) : true;
     }
 
     bool is_marked(const base_offset_ptr *p) {
-      const std::size_t beg_word = p->offset() >> 3;
-      return is_marked(compute_bitmap_index(beg_word), compute_bit_number(beg_word));
+      /*
+       * We don't need to remove special_ptr_type from offset_ptr as it will right shifted
+       * by compute_bitmap_index and compute_bit_number. Be careful about changes in these
+       * functions' implementation.
+       * constexpr auto ptr_type_fld = bits::field<special_ptr_type, std::size_t>(0, 2);
+       * const std::size_t beg_byte = ptr_type_fld.replace(p->offset(), special_ptr_type::Strong);
+       */
+      const std::size_t beg_byte = p->offset();
+      return is_marked(compute_bitmap_index(beg_byte), compute_bit_number(beg_byte));
     }
 
     void mark_weak(const offset_ptr<std::size_t> p) {
-      return mark_weak(p.offset() >> 3);
+      return mark_weak(p.offset());
     }
 
     bool mark_end_first(const offset_ptr<const gc_allocated> &p) {
       assert(p->get_gc_descriptor().is_valid());
-      const std::size_t beg_word = p.offset() >> 3;
-      const std::size_t end_word = beg_word + p->get_gc_descriptor().object_size() - 1;
-      return _mark_end_first(beg_word, end_word);
+      const std::size_t beg_byte = p.offset();
+      const std::size_t end_byte = beg_byte + ((p->get_gc_descriptor().object_size() - 1) << 3);
+      return _mark_end_first(beg_byte, end_byte);
     }
 
-    void mark_begin_first(const offset_ptr<const gc_allocated> &p) {
+    bool mark_begin_first(const offset_ptr<const gc_allocated> &p) {
       assert(p->get_gc_descriptor().is_valid());
-      const std::size_t beg_word = p.offset() >> 3;
-      const std::size_t end_word = beg_word + p->get_gc_descriptor().object_size() - 1;
-      mark_begin_first(beg_word, end_word);
+      const std::size_t beg_byte = p.offset();
+      const std::size_t end_byte = beg_byte + ((p->get_gc_descriptor().object_size() - 1) << 3);
+      return _mark_begin_first(beg_byte, end_byte);
     }
 
     std::size_t find_next_free_word(std::size_t word, std::size_t end, bool &found_set_bit) const {
-      bit_number_t bit = compute_bit_number(word);
-      bitmap_idx_t idx = compute_bitmap_index(word);
-      bitmap_idx_t end_idx = compute_bitmap_index(end);
+      bit_number_t bit = compute_bit_number(word << 3);
+      bitmap_idx_t idx = compute_bitmap_index(word << 3);
+      bitmap_idx_t end_idx = compute_bitmap_index(end << 3);
       do {
         rep_t B = _end[idx] & construct_left_mask(bit);
         while (B == 0) {
@@ -673,9 +652,9 @@ namespace mpgc {
     }
 
     std::size_t find_next_used_word(std::size_t word, std::size_t end) const {
-      bit_number_t bit = compute_bit_number(word);
-      bitmap_idx_t idx = compute_bitmap_index(word);
-      bitmap_idx_t end_idx = compute_bitmap_index(end);
+      bit_number_t bit = compute_bit_number(word << 3);
+      bitmap_idx_t idx = compute_bitmap_index(word << 3);
+      bitmap_idx_t end_idx = compute_bitmap_index(end << 3);
       if (idx >= end_idx) {
         return idx << value_log_bits;
       }
@@ -692,8 +671,8 @@ namespace mpgc {
 
     //Actually, this function returns the prev in-use word + 1.
     std::size_t find_prev_used_word(std::size_t word) const {
-      bit_number_t bit = compute_bit_number(word);
-      bitmap_idx_t idx = compute_bitmap_index(word);
+      bit_number_t bit = compute_bit_number(word << 3);
+      bitmap_idx_t idx = compute_bitmap_index(word << 3);
       rep_t B = _end[idx];
       B &= construct_right_mask(bit);
       while (B == 0) {
@@ -735,40 +714,53 @@ namespace mpgc {
     }
 
     void test_bitmaps(const bool set_bitmap) {
-      volatile std::size_t i;
+      std::size_t i;
       for(i = 0; i < _sweep_bitmap_size; i++) {
         set_bitmap ? assert(_sweep_bitmap_begin[i] == rep_t(-1) && _sweep_bitmap_end[i] == rep_t(-1)) :
                      assert(_sweep_bitmap_begin[i] == 0 && _sweep_bitmap_end[i] == 0);
       }
 
       for(i = 0; i < _size; i++) {
-        assert(_begin[i] == 0);
-        assert(_end[i] == 0);
-        assert(_weak[i] == 0);
+        assert(_begin[i] == 0 && _end[i] == 0 && _weak[i] == 0);
       }
     }
 
-    bool expand_free_chunk(std::size_t*,
-                           offset_ptr<gc_allocator::global_chunk>,
-                           std::size_t, std::size_t&, std::size_t&);
+    bool expand_free_chunk(offset_ptr<gc_allocator::global_chunk> c,
+                           std::size_t size,
+                           std::size_t &beg_word,
+                           std::size_t &end_word) {
+      beg_word = c.offset() >> 3;
+      end_word = beg_word + (size >> 3);
+
+      beg_word = find_prev_used_word(beg_word);
+      end_word = find_next_used_word(end_word, _size << value_log_bits);
+      //find_next_used_word returns the next used word. So we must decrement by 1.
+
+      /* Q: Why add 1 to beg_word?
+       * A: Because in case beg_word corresponds to a just collected object's
+       *    beginning and we are suppose to clear some weak_gc_ptr to this
+       *    object, then we will not be able to do so as the weak ptr clearing
+       *    logic works entirely on the check whether the corresponding object
+       *    is marked in the bitmaps or not.
+       *    In order to get around this, we mark the second word of the expanded
+       *    chunk, rather than the first one. Since all threads will try to do so,
+       *    it resolves the concurrency.
+       */
+      return _mark_begin_first((beg_word + 1) << 3, (end_word - 1) << 3);
+    }
+
+    bool expand_free_chunk(std::size_t*, offset_ptr<gc_allocator::global_chunk>, std::size_t, std::size_t&, std::size_t&);
     void post_sweep_phase(per_process_struct*, const bool);
     bool post_sweep_phase_without_load_balancing(per_process_struct*, const bool);
     void post_sweep_clear(const std::size_t, const bool);
-    void process_logical_chunk(gc_control_block&,
-                               gc_allocator::skiplist&,
-                               const std::size_t,
-                               const bool);
-    void _cleanup_sweep1_phase(per_process_struct*, gc_allocator::skiplist&, const bool);
-    void cleanup_weak_ptrs(gc_control_block&, std::size_t, const std::size_t);
+    void process_logical_chunk(gc_allocator::globalListType&, const std::size_t, const bool);
+    void cleanup_weak_ptrs(std::size_t, const std::size_t);
     void verify_weak_ptrs_cleanup();
     void verify_weak_ptr_cleanup(std::size_t*);
-    //void cleanup_weak_ptr(std::size_t*);
-    void atomic_cleanup_weak_ptr(gc_control_block&, std::size_t*);
+    void cleanup_weak_ptr(std::size_t*);
+    void atomic_cleanup_weak_ptr(std::size_t*);
     void set_sweep_bitmap_range(const std::size_t, const std::size_t, const bool);
-    void expand_and_put_chunk(gc_control_block&, gc_allocator::skiplist&, chunk_expansion_slot&, const bool, std::mt19937&);
-    void sweep1_phase(gc_control_block&, chunk_expansion_slot&, std::mt19937&,const uint8_t, const bool, const bool);
     void sweep2_phase(const bool);
-    void mark_gc_control_block();
   };
 }
 

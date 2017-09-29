@@ -61,8 +61,8 @@ namespace ruts {
   private:
 
     Allocator _alloc;
-    pointer _start;
-    size_type _size;
+    T *_start;
+    unsigned _size;
     enum Raw { RAW };
     explicit runtime_array(
         Raw raw,
@@ -245,11 +245,11 @@ namespace ruts {
       return _start[_size-1];
     }
 
-    pointer data() {
+    T *data() {
       return _start;
     }
 
-    const_pointer data() const {
+    const T *data() const {
       return _start;
     }
 

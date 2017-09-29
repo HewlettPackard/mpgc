@@ -55,10 +55,6 @@ namespace mpgc {
   using versioned_gc_ptr = ruts::versioned<gc_ptr<T>, NFlags, base_offset_ptr::used_bits()>;
   template <typename T, std::size_t NFlags = 0>
   using atomic_versioned_gc_ptr = ruts::atomic_versioned<gc_ptr<T>, NFlags, base_offset_ptr::used_bits()>;
-  template <typename T, std::size_t NFlags = 0>
-  using versioned_weak_gc_ptr = ruts::versioned<weak_gc_ptr<T>, NFlags, base_offset_ptr::used_bits()>;
-  template <typename T, std::size_t NFlags = 0>
-  using atomic_versioned_weak_gc_ptr = ruts::atomic_versioned<weak_gc_ptr<T>, NFlags, base_offset_ptr::used_bits()>;
 
   class gc_descriptor;
 
@@ -254,7 +250,7 @@ namespace mpgc {
     };
 
     /** 
-     * A 22-bit field (bits 0--21) used to check validity.
+     * A 22-bit field (bits 0--22) used to check validity.
      *
      * If the object descriptor is valid, this field will hold bits
      * 3--25 of an offset_ptr pointing to the descriptor's location.
@@ -347,7 +343,6 @@ namespace mpgc {
      * object descriptor, as indicated by #cat_fld.
      */
     constexpr static auto include_fields_fld = bool_field(60);
-
     /**
      * A 3-bit field (bits 57--59) that holds the number of field
      * indices in the list.
@@ -366,47 +361,36 @@ namespace mpgc {
     /**
      * Bit-field widths to use for lists of sizes given by #n_fields_fld.
      */
-    constexpr static std::size_t list_width[] = { 33, 16, 11, 8, 6, 5, 4, 4};
+    constexpr static std::size_t list_width[] = { 35, 17, 11, 8, 7, 5, 5, 4};
 
     /**
-     * A 33-bit field (bits 24--56) that holds the number of fields for
+     * A 35-bit field (bits 22-56) that holds the number of fields for
      * a blob (or reference array).
      *
      * @pre This is only valid if the object descriptor is a list
      * object descriptor, as indicated by #cat_fld and the list
      * length (as given by #n_fields_fld) is zero.
      */
-    constexpr static auto blob_size_fld = size_field(24, 33);
+    constexpr static auto blob_size_fld = size_field(22, 35);
     /**
-     * A 16-bit field (bits 41--56) that holds the number of fields for
+     * A 17-bit field (bits 40-56) that holds the number of fields for
      * a 1-item list object descriptor.
      *
      * @pre This is only valid if the object descriptor is a list
      * object descriptor, as indicated by #cat_fld and the list
      * length (as given by #n_fields_fld) is one.
      */
-    constexpr static auto l1_size_fld = size_field(41, 16);
+    constexpr static auto l1_size_fld = size_field(40, 17);
     /**
-     * A 16-bit field (bits 25--40) that holds the (single) field index
+     * A 17-bit field (bits 40-56) that holds the (single) field index
      * for a 1-item list object descriptor.
      *
      * @pre This is only valid if the object descriptor is a list
      * object descriptor, as indicated by #cat_fld and the list
      * length (as given by #n_fields_fld) is one.
      */
-    constexpr static auto l1_f1_fld = size_field(25, 16);
+    constexpr static auto l1_f1_fld = size_field(23, 17);
 
-    /**
-     * A 1-bit field (bit 23) that indicates that the described object
-     * was allocated during the sweep phase.
-     */
-    constexpr static auto sweep_allocated_fld = bool_field(23);
-    /**
-     * A 1-bit field (bit 22) that indicates that the object described
-     * was seen during tracing as the unmarked referent of a weak
-     * pointer controlling a contingent pointer.
-     */
-    constexpr static auto in_control_map_fld = bool_field(22);
 
     /*
      * These cannot be defined until gc_descriptor is complete
@@ -492,7 +476,6 @@ namespace mpgc {
     {
       const base_offset_ptr &temp = reinterpret_cast<const base_offset_ptr&>(_rep);
       assert(!temp.is_valid());
-      assert(!other.is_illegal());
       _rep = other.is_compact() ? check_bits_fld.replace(other._rep,
                                                          correct_check_bits())
              : other._rep;
@@ -523,8 +506,7 @@ namespace mpgc {
     constexpr gc_descriptor(as_indirect, const base_offset_ptr &ptr) 
       : _rep(cat_fld.encode(cat::external)
 	     | ptr.val())
-    {
-    }
+    {}
 
     /**
      * Construct a blob object descriptor.
@@ -541,7 +523,8 @@ namespace mpgc {
 	     | n_fields_fld.encode(0)
 	     | include_fields_fld.encode(true)
 	     | blob_size_fld.encode(words))
-    {}
+    {
+    }
 
     
     /**
@@ -903,7 +886,6 @@ namespace mpgc {
               std::forward<Fn>(fn)(i);
             }
           }
-          break;
         }
       default:
         assert(0);
@@ -1118,40 +1100,6 @@ namespace mpgc {
      */
     static void trace_desc(rep_type r, const char *type_name) {
       gc_descriptor(direct{}, r).trace(type_name);
-    }
-
-    bool was_allocated_during_sweep() const {
-      return sweep_allocated_fld[_rep];
-    }
-
-    void set_sweep_allocated() {
-      sweep_allocated_fld[_rep] = true;
-    }
-     
-
-    bool atomic_clear_sweep_allocated() {
-      std::atomic<rep_type> &atomic_rep = reinterpret_cast<std::atomic<rep_type> &>(_rep);
-      const rep_type only_bit = sweep_allocated_fld.encode(true);
-      rep_type was = atomic_rep.fetch_and(~only_bit);
-      return sweep_allocated_fld[was];
-    }
-
-    bool is_in_control_map() const {
-      return in_control_map_fld[_rep];
-    }
-
-    bool atomic_set_in_control_map() {
-      std::atomic<rep_type> &atomic_rep = reinterpret_cast<std::atomic<rep_type> &>(_rep);
-      const rep_type only_bit = in_control_map_fld.encode(true);
-      rep_type was = atomic_rep.fetch_or(only_bit);
-      return !in_control_map_fld[was];
-    }
-
-    bool atomic_clear_in_control_map() {
-      std::atomic<rep_type> &atomic_rep = reinterpret_cast<std::atomic<rep_type> &>(_rep);
-      const rep_type only_bit = in_control_map_fld.encode(true);
-      rep_type was = atomic_rep.fetch_and(~only_bit);
-      return in_control_map_fld[was];
     }
   };
 
@@ -1407,10 +1355,6 @@ s   */
     }
 
     gc_descriptor to_descriptor();
-
-    static bool is_bitmap(const gc_descriptor &d) {
-      return d.is_bitmap();
-    }
   private:
     gc_descriptor make_external() const;
 
@@ -1527,25 +1471,6 @@ s   */
     }
   };
   
-
-  template <typename...Types> class type_printer;
-
-  template <>
-  struct type_printer<> {
-    template <typename Out, typename Prefix>
-    static auto &print(Out &out, Prefix &&prefix) {
-      return out;
-    }
-  };
-  
-  template <typename T, typename...More>
-  struct type_printer<T, More...> {
-    template <typename Out, typename Prefix>
-    static auto &print(Out &out, Prefix&& prefix) {
-      out << std::forward<Prefix>(prefix) << typeid(T).name() << std::endl;
-      return type_printer<More...>::print(out, std::forward<Prefix>(prefix));
-    }
-  };
 
   /**
    * The portions of desc_spec<T,Fields> that do not depend on the
@@ -1999,7 +1924,6 @@ s   */
       check_coverage<desc_spec_base<T>::template width<T>(), desc_spec_base<T>::template coverage_mask<Fields...>()>();
       collector c;
       gc_descriptor d = c.to_descriptor();
-      // type_printer<Fields...>::print(std::cout, "Field: ");
       // d.trace(typeid(T).name());
       return d;
     }
@@ -2198,23 +2122,6 @@ s   */
     : is_ref_descriptor {};
 
   /**
-   * A specialization of gc_traits for versioned_gc_ptr<T,NFlags>.
-   *
-   * This is a single GC reference.
-   */
-  template <typename T, std::size_t NFlags>
-  struct gc_traits<versioned_weak_gc_ptr<T,NFlags>> : is_ref_descriptor {};
-
-  /**
-   * A specialization of gc_traits for atomic_versioned_gc_ptr<T,NFlags>.
-   *
-   * This is a single GC reference.
-   */
-  template <typename T, std::size_t NFlags>
-  struct gc_traits<atomic_versioned_weak_gc_ptr<T,NFlags>>
-    : is_ref_descriptor {};
-
-  /**
    * A specialization of gc_traits for std::atomic<T>.
    *
    * delegates to gc_traits<T>.
@@ -2226,16 +2133,6 @@ s   */
       return gc_traits<T>::descriptor();
     }
   };
-
-  /**
-   * A specialization of gc_traits for ruts::packed_word<W,Fields...>
-   *
-   * By default, packed words don't contain references.
-   */
-  template <typename W, typename...Fields>
-  struct gc_traits<ruts::packed_word<W,Fields...>>
-    : no_ref_descriptor<ruts::packed_word<W,Fields...>>
-  {};
 
   /**
    * A specialization of gc_traits for std::pair<X,Y>.

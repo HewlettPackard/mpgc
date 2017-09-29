@@ -27,120 +27,40 @@
 #ifndef WEAK_BARRIERS_H
 #define WEAK_BARRIERS_H
 
-#include<type_traits>
-
 namespace mpgc {
-  template <typename T>
-  bool weak_gc_ptr<T>::marked_or_sweep_allocated(gc_control_block &cb,
-                                                 const offset_ptr<T> &p) {
-    static_assert(std::is_base_of<gc_allocated, T>::value,
-                  "T is not derived from gc_allocated");
-    constexpr auto ptr_type_fld = bits::field<special_ptr_type, std::size_t>(0, 2);
-    if (!cb.bitmap.is_marked(p)) {
-      const offset_ptr<T> ptr(ptr_type_fld.replace(p.val(),
-                                                   special_ptr_type::Strong));
-      if (!ptr->get_gc_descriptor().was_allocated_during_sweep()) {
-        return false;
-      }
-    }
-    return true;
-  }
-
-  template <typename T>
-  void weak_gc_ptr<T>::clear_sweep_allocated(const offset_ptr<T> &p) {
-    static_assert(std::is_base_of<gc_allocated, T>::value,
-                  "T is not derived from gc_allocated");
-    constexpr auto ptr_type_fld = bits::field<special_ptr_type, std::size_t>(0, 2);
-    const offset_ptr<T> ptr(ptr_type_fld.replace(p.val(),
-                                                 special_ptr_type::Strong));
-    std::const_pointer_cast<std::remove_const_t<T>>(ptr)->
-                     get_non_const_gc_desc().atomic_clear_sweep_allocated();
-  }
-
-  template <typename T> template <typename Fn>
-  void weak_gc_ptr<T>::write_barrier(Fn &&func) {
-    gc_handshake::in_memory_thread_struct &tstruct =
-                           *gc_handshake::thread_struct_handles.handle;
-
-    tstruct.weak_signal = gc_handshake::Weak_signal::InBarrier;
-    tstruct.sweep_signal_disabled = true;
-
-    tstruct.on_stack_wp_set.erase(this);
-    std::forward<Fn>(func)();
-
-    tstruct.sweep_signal_disabled = false;
-    if (tstruct.sweep_signal_requested) {
-      tstruct.sweep_signal_requested = false;
-      gc_handshake::do_deferred_sweep_signal(tstruct);
-    }
-    tstruct.weak_signal = gc_handshake::Weak_signal::Working;
-  }
-
-  template<typename T> template<typename LoadFn, typename ModFn>
-  void weak_gc_ptr<T>::write_barrier(void *lhs,
-                                     const void *rhs,
-                                     LoadFn&& load_func,
-                                     ModFn&& mod_func) noexcept {
-    static_assert(std::is_base_of<gc_allocated, T>::value,
-                  "T is not derived from gc_allocated");
+  template<typename T> template<typename Y, typename>
+  void weak_gc_ptr<T>::write_barrier(const weak_gc_ptr<Y>& rhs) noexcept {
     constexpr auto stage_bits_fld = bits::field<Weak_stage, uint16_t>(0, 2);
-    constexpr auto ptr_type_fld = bits::field<special_ptr_type, std::size_t>(0, 2);
-
-    gc_handshake::in_memory_thread_struct &thread_struct =
-                                 *gc_handshake::thread_struct_handles.handle;
+    gc_handshake::in_memory_thread_struct &thread_struct = *gc_handshake::thread_struct_handles.handle;
     gc_control_block &cb = control_block();
 
-    thread_struct.sweep_signal_disabled = true;
-    auto it = thread_struct.on_stack_wp_set.find(rhs);
-    if (it != thread_struct.on_stack_wp_set.end()) {
-      constexpr auto ptr_fld =
-         bits::field<std::size_t, std::size_t>(0, base_offset_ptr::used_bits());
-      size_t *p = static_cast<size_t*>(const_cast<void*>(rhs));
-      *p = ptr_fld.replace(*p, 0);
-      thread_struct.on_stack_wp_set.erase(it);
-    }
-    thread_struct.on_stack_wp_set.erase(lhs);
-    thread_struct.sweep_signal_disabled = false;
-    if (thread_struct.sweep_signal_requested) {
-      thread_struct.sweep_signal_requested = false;
-      gc_handshake::do_deferred_sweep_signal(thread_struct);
-    }
-
     thread_struct.weak_signal = gc_handshake::Weak_signal::InBarrier;
-    offset_ptr<T> r = std::forward<LoadFn>(load_func)();
+    offset_ptr<T> r = rhs._ptr;
     Weak_stage s = stage_bits_fld.decode(cb.weak_stage);
     switch (s) {
       case Weak_stage::Normal:
         break;
       case Weak_stage::Trace:
       case Weak_stage::Repeat:
-        if (!base_offset_ptr::is_valid(lhs)) {
+        if (!base_offset_ptr::is_valid(this)) {
           break;
         }
-        clear_sweep_allocated(r);
       case Weak_stage::Clean:
         if (!cb.bitmap.is_marked(r, true)) {
           if (s == Weak_stage::Clean) {
-            offset_ptr<T> ptr(ptr_type_fld.replace(r.val(),
-                                                   special_ptr_type::Strong));
-            if (!ptr->get_gc_descriptor().was_allocated_during_sweep()) {
-              r = nullptr;
-            }
+            r = nullptr;
           } else {
-            cb.bitmap.mark_weak((std::size_t*)lhs);
+            cb.bitmap.mark_weak((std::size_t*)this);
           }
         }
     }
-    std::forward<ModFn>(mod_func)(r);
+    _ptr = r;
     thread_struct.weak_signal = gc_handshake::Weak_signal::Working;
   }
 
   template<typename T>
   gc_ptr<T> weak_gc_ptr<T>::lock() const noexcept {
-    static_assert(std::is_base_of<gc_allocated, T>::value,
-                  "T is not derived from gc_allocated");
-    gc_handshake::in_memory_thread_struct &thread_struct =
-                           *gc_handshake::thread_struct_handles.handle;
+    gc_handshake::in_memory_thread_struct &thread_struct = *gc_handshake::thread_struct_handles.handle;
     gc_control_block &cb = control_block();
     per_process_struct &proc = *gc_handshake::process_struct;
 
@@ -151,26 +71,6 @@ namespace mpgc {
     constexpr auto ptr_type_fld = bits::field<special_ptr_type, std::size_t>(0, 2);
 
     bool done = false;
-
-    thread_struct.sweep_signal_disabled = true;
-    auto it = thread_struct.on_stack_wp_set.find(&_ptr);
-    if (it != thread_struct.on_stack_wp_set.end()) {
-      constexpr auto ptr_fld =
-         bits::field<std::size_t, std::size_t>(0, base_offset_ptr::used_bits());
-      size_t *p = reinterpret_cast<size_t*>(const_cast<offset_ptr<T>*>(&_ptr));
-      *p = ptr_fld.replace(*p, 0);
-      thread_struct.on_stack_wp_set.erase(it);
-      done = true;
-    }
-
-    thread_struct.sweep_signal_disabled = false;
-    if (thread_struct.sweep_signal_requested) {
-      thread_struct.sweep_signal_requested = false;
-      gc_handshake::do_deferred_sweep_signal(thread_struct);
-    }
-    if (done) {
-      return nullptr;
-    }
 
     offset_ptr<T> r(ptr_type_fld.replace(_ptr.val(), special_ptr_type::Strong));
     if (!r.is_valid()) {
@@ -200,9 +100,7 @@ namespace mpgc {
       } else {
         switch (s) {
           case Weak_stage::Clean:
-            if (!r->get_gc_descriptor().was_allocated_during_sweep()) {
-              r = nullptr;
-            }
+            r = nullptr;
           case Weak_stage::Normal:
             done = true;
             break;
@@ -210,13 +108,11 @@ namespace mpgc {
             {//First try to acquire process-local lock.
               uint16_t expected = proc.gc_mutator_weak_sync;
               while (state_bits_fld.decode(expected) == gc_mutator_weak_sync_state::Work) {
-                if (proc.gc_mutator_weak_sync.
-                         compare_exchange_weak(expected,
-                                               nr_thread_bits_fld.
-                                               replace(expected,
-                                                       nr_thread_bits_fld.decode(expected) + 1))) {
+                if (proc.gc_mutator_weak_sync.compare_exchange_weak(expected,
+                                                                    nr_thread_bits_fld.replace(expected,
+                                                                                             nr_thread_bits_fld.decode(expected) + 1))) {
                   //We got the process-local lock.
-                  thread_struct.persist_data->mbuf.add_element(r);
+                  thread_struct.mbuffer->add_element(r);
                   /*
                    * Here we are certain that the sync is in <i, Work> state with i > 1.
                    * So we can use fetch_sub, instead of cas, to decrement thread count.
@@ -232,15 +128,12 @@ namespace mpgc {
              * Couldn't do the marking through process-local mechanism above. Lets try the
              * global weak stage now.
              */
-            if (done || !cb.weak_stage.
-                            compare_exchange_strong(expected_stage,
-                                                    stage_bits_fld.
-                                                    replace(expected_stage,
-                                                            Weak_stage::Repeat))) {
+            if (done || !cb.weak_stage.compare_exchange_strong(expected_stage,
+                                                               stage_bits_fld.replace(expected_stage, Weak_stage::Repeat))) {
               break;
             }
           case Weak_stage::Repeat:
-            thread_struct.persist_data->mbuf.add_element(r);
+            thread_struct.mbuffer->add_element(r);
             done = true;
         }
       }

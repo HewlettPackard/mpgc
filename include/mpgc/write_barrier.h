@@ -44,39 +44,32 @@ namespace mpgc {
    */
   inline void mark_gray(const offset_ptr<const gc_allocated> p, gc_handshake::in_memory_thread_struct &thread_struct) {
     if (p.is_valid() && !p.is_weak() && !thread_struct.bitmap->is_marked(p)) {
-      thread_struct.persist_data->mbuf.add_element(p);
+      thread_struct.mbuffer->add_element(p);
     }
   }
-
 
   /*
    * The write barrier function that is called on reference update.
    * The barrier, in order to be atomic wrt. sync and async phases,
    * defers handshake in the beginning, does the barrier and reference
    * update and then checks if a handshake is pending.
-   *
-   * We take the pointers as generic offset_ptrs rather than
-   * specifically pointing to const gc_allocated because at the point
-   * the write_barrier is invoked (e.g., during an assignment), the
-   * referened type may still be a forward declaration, and the
-   * compiler won't be able to prove that it derives from
-   * gc_allocated.  
-   *
-   * To make it more likely that the compiler will be willing to
-   * inline this (and to avoid an explosion of out-of-line functions
-   * when it isn't), we split the write barrier into two parts: a
-   * prologue, which is called before the specific operation function,
-   * and an epilogue, which is called after.  The prologue and
-   * epilogue are non-templated.
    */
-  inline void write_barrier_prologue(const offset_ptr<const gc_allocated> &lhs,
-                                     const offset_ptr<const gc_allocated> &rhs,
-                                     gc_handshake::in_memory_thread_struct &thread_struct)
-  {
+  template <typename Fn>
+  inline void write_barrier(const offset_ptr<const gc_allocated> &lhs,
+                     const offset_ptr<const gc_allocated> &rhs,
+                     Fn&& func) {
     const offset_ptr<const gc_allocated> l = lhs;
     assert(!l.is_valid() || l->get_gc_descriptor().is_valid());
     assert(!rhs.is_valid() || rhs->get_gc_descriptor().is_valid());
 
+    // If lhs and rhs are both same, then we don't need to trigger the barrier.
+    if (lhs == rhs) {
+      std::forward<Fn>(func)();
+      return;
+    }
+
+    //Is there a way to avoid the function call to fetch the thread_local?
+    gc_handshake::in_memory_thread_struct &thread_struct = *gc_handshake::thread_struct_handles.handle;
     thread_struct.mark_signal_disabled = true;
 
     /* The following signal_fence because the sync/async disabling above
@@ -92,12 +85,10 @@ namespace mpgc {
       mark_gray(lhs, thread_struct);
     default: break;
     }
-  }
 
-  inline void write_barrier_epilogue(const offset_ptr<const gc_allocated> &lhs,
-                                     const offset_ptr<const gc_allocated> &rhs,
-                                     gc_handshake::in_memory_thread_struct &thread_struct)
-  {
+    //Perform the reference update operation
+    std::forward<Fn>(func)();
+
     /* The following signal_fence because the reference update above
      * *must* happen before the handshake is enabled below.
      */
@@ -107,36 +98,13 @@ namespace mpgc {
     switch (thread_struct.mark_signal_requested) {
     case gc_handshake::Signum::sigSync1:
     case gc_handshake::Signum::sigSync2:
-      thread_struct.status_idx = gc_status(thread_struct.mark_signal_requested,
-                                           thread_struct.status_idx.load().index());
+      thread_struct.status_idx = gc_status(thread_struct.mark_signal_requested, thread_struct.status_idx.load().index());
       break;
     case gc_handshake::Signum::sigAsync:
       gc_handshake::do_deferred_async_signal(thread_struct);
     default: break;
     }
     thread_struct.mark_signal_requested = gc_handshake::Signum::sigInit;
-  }
-
-  template <typename T, typename U, typename Fn>
-  inline void write_barrier(const offset_ptr<T> &lhs,
-                            const offset_ptr<U> &rhs,
-                            Fn&& func)
-  {
-    // If lhs and rhs are both same, then we don't need to trigger the barrier.
-    if (lhs == rhs) {
-      std::forward<Fn>(func)();
-      return;
-    }
-    //Is there a way to avoid the function call to fetch the thread_local?
-    gc_handshake::in_memory_thread_struct
-      &thread_struct = *gc_handshake::thread_struct_handles.handle;
-    write_barrier_prologue(reinterpret_cast<const offset_ptr<const gc_allocated> &>(lhs),
-                           reinterpret_cast<const offset_ptr<const gc_allocated> &>(rhs),
-                           thread_struct);
-    std::forward<Fn>(func)();
-    write_barrier_epilogue(reinterpret_cast<const offset_ptr<const gc_allocated> &>(lhs),
-                           reinterpret_cast<const offset_ptr<const gc_allocated> &>(rhs),
-                           thread_struct);
   }
 }
 

@@ -39,7 +39,7 @@
 #include "mpgc/gc_desc.h"
 #include "mpgc/gc_allocated.h"
 #include "mpgc/gc_array.h"
-#include "mpgc/gc_skiplist_allocator.h"
+#include "mpgc/gc_allocator.h"
 #include "mpgc/gc_ptr.h"
 #include "mpgc/gc_allocate.h"
 #include "mpgc/gc_versioned.h"
@@ -50,7 +50,6 @@
 #include "mpgc/gc_cuckoo_map.h"
 #include "mpgc/weak_gc_ptr.h"
 #include "mpgc/contingent_gc_ptr.h"
-#include "mpgc/bump_allocation_slots.h"
 
 #include "ruts/collections.h"
 #include "ruts/managed.h"
@@ -84,15 +83,15 @@ namespace mpgc {
 
   class gc_mem_stats {
     std::atomic<std::size_t> gc_cycle_num;
-    offset_ptr<gc_control_block> cblk;
+    std::atomic<versioned_pcount_t> &process_count;
     const std::size_t heap_size;
     std::atomic<std::size_t> in_use_stable;
     std::atomic<std::size_t> in_use_current;
     std::atomic<std::size_t> n_objects_stable;
     std::atomic<std::size_t> n_objects_current;
     friend class gc_control_block;
-    gc_mem_stats(std::size_t hs, offset_ptr<gc_control_block> cb)
-      : gc_cycle_num(0), cblk(cb), heap_size(hs),
+    gc_mem_stats(std::size_t hs, std::atomic<versioned_pcount_t> &pc)
+      : gc_cycle_num(0), process_count(pc), heap_size(hs),
 	in_use_stable(0), in_use_current(0),
 	n_objects_stable(0), n_objects_current(0)
     {}
@@ -112,9 +111,9 @@ namespace mpgc {
     std::size_t cycle_number() const {
       return gc_cycle_num;
     }
-
-    std::size_t n_processes() const;
-
+    std::size_t n_processes() const {
+      return process_count.load().count;
+    }
     std::size_t n_objects() const {
       return n_objects_stable;
     }
@@ -322,10 +321,7 @@ namespace mpgc {
   };
 
   struct gc_control_block {
-    //We need 1 bit in expansion_slots_total below. So if the size of array
-    //below needs to be larger than (1<<15), then use a type for the counter accordingly.
-    std::array<gc_allocator::skiplist, 2> global_free_lists;
-    gc_allocator::bump_allocation_slots bump_alloc_slots;
+    gc_allocator::globalListType global_free_list[2];
 
     persistent_roots_t persistent_roots;
 
@@ -344,28 +340,23 @@ namespace mpgc {
 
     std::array<std::atomic<pcount_t>, std::size_t(Barrier_indices::arraysize)> barrier_sync;
 
-    std::atomic<uint16_t> expansion_slots_counter;
-
     std::atomic<uint16_t> weak_stage;
     std::atomic<gc_status> status;
 
     std::atomic<Stage> stage;
 
-    gc_control_block(std::size_t size, uint8_t* after_cblock) :
-      bump_alloc_slots(after_cblock),
+    gc_control_block(uint8_t *p, std::size_t size) :
       bitmap(size),
-      mem_stats(size, this),
+      mem_stats(size, total_process_count),
       total_process_count(versioned_pcount_t()),
       marking_barrier(marking_barrier_type(Barrier_stage::incrementing, Barrier_indices::marking1)),
       weak_stage(0),
       status(gc_status(gc_handshake::Signum::sigSweep)),
       stage(Stage::Sweeped)
     {
-      std::size_t size_bump_slots_block = bump_alloc_slots.sentinel[0]->get_gc_descriptor().object_size() << 3;
-      std::size_t* first_free_word = reinterpret_cast<std::size_t*>(after_cblock + size_bump_slots_block);
-
-      global_free_lists[0].set_tail(reinterpret_cast<gc_allocator::global_chunk*>(first_free_word),
-                                    (size - sizeof(gc_control_block) - size_bump_slots_block) >> 3);
+      //assert((reinterpret_cast<std::size_t>(global_free_list.load()) & 0xf) == 0);
+      global_free_list[0][gc_allocator::global_list_index_for(size)] =
+                   gc_allocator::list_head(new (p) gc_allocator::global_chunk(size));
 
       for (uint8_t i = 0; i < barrier_sync.size(); i++) {
         barrier_sync[i] = 0;
@@ -374,7 +365,6 @@ namespace mpgc {
   };
 
   extern gc_control_block &control_block();
-  extern void init_on_createheap();
 
   inline
   persistent_roots_t &persistent_roots() {
@@ -388,6 +378,7 @@ namespace mpgc {
     initialize_thread();
     return control_block().mem_stats;
   }
+
 
   template <typename Fn>
   auto gc_safe(Fn &&fn) {

@@ -62,7 +62,6 @@ namespace bits {
       constexpr explicit reference(U &loc, U m, std::size_t s)
 	: _loc(loc), _mask(m), _shift(s)
       {}
-      friend field<T,U>;
     public:
       constexpr operator T() const {
 	return static_cast<T>((_loc & _mask) >> _shift);
@@ -131,7 +130,6 @@ namespace bits {
       constexpr explicit reference(U &loc, U m)
 	: _loc(loc), _mask(m)
       {}
-      friend field<bool,U>;
     public:
       constexpr operator bool() const {
 	return (_loc & _mask);

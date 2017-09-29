@@ -44,7 +44,7 @@
 #include <unordered_set>
 #include <vector>
 
-//#define TEST_WEAK_PTRS
+#define TEST_WEAK_PTRS
 
 using namespace std;
 using namespace mpgc;
